@@ -31,9 +31,9 @@ YTDL_OPTS = {
     "source_address": "0.0.0.0",    # обход некоторых проблем с IPv6
     "skip_download": True,
     "cachedir": False,              # не плодить кэш на диске
-    # Лёгкие клиенты YouTube быстрее отдают потоки и реже ловят
-    # «Sign in to confirm / 403», чем дефолтный web-клиент.
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    # ВНИМАНИЕ: не форсируем player_client. Принудительный android-клиент YouTube
+    # отдаёт throttled-потоки → музыка лагает/заикается. Пусть yt-dlp сам выбирает
+    # лучший рабочий клиент — так поток стабильнее.
 }
 
 # ── Настройки FFmpeg ──────────────────────────────────────────────────────────
@@ -189,11 +189,12 @@ class MusicPlayer:
             self.state.current = track
 
             try:
-                # method="fallback" — если ffprobe недоступен/тормозит, не падаем,
-                # а определяем кодек запасным способом.
+                # from_probe (метод по умолчанию — ffprobe) точно определяет кодек:
+                # если это opus, FFmpeg копирует поток без перекодирования (дёшево).
+                # Не форсируем fallback — он может ошибиться с кодеком и вызвать
+                # постоянное перекодирование → нагрузка на CPU и заикания.
                 source = await discord.FFmpegOpusAudio.from_probe(
                     track.stream_url,
-                    method="fallback",
                     before_options=FFMPEG_BEFORE_OPTS,
                     options=FFMPEG_OPTS,
                 )
