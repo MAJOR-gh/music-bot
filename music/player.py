@@ -3,14 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import discord
 import yt_dlp
 
-from .queue import GuildMusicState
+from .queue import GuildMusicState, RepeatMode
 from .track import SearchResult, Track
 
 logger = logging.getLogger("music_bot.player")
+
+# Выделенный пул потоков под блокирующие вызовы yt-dlp (resolve/search). Свой пул,
+# чтобы тяжёлые extract_info не конкурировали с дефолтным executor event-loop'а и
+# нагрузка была предсказуемой. 4 воркера с запасом покрывают несколько серверов.
+_YTDL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdl")
 
 # ── Настройки yt-dlp ──────────────────────────────────────────────────────────
 # Получаем ТОЛЬКО метаданные + прямой URL потока, без скачивания на диск.
@@ -24,6 +30,10 @@ YTDL_OPTS = {
     "default_search": "ytsearch",   # текстовый запрос → поиск на YouTube
     "source_address": "0.0.0.0",    # обход некоторых проблем с IPv6
     "skip_download": True,
+    "cachedir": False,              # не плодить кэш на диске
+    # Лёгкие клиенты YouTube быстрее отдают потоки и реже ловят
+    # «Sign in to confirm / 403», чем дефолтный web-клиент.
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
 }
 
 # ── Настройки FFmpeg ──────────────────────────────────────────────────────────
@@ -84,9 +94,9 @@ class MusicPlayer:
         """Получить Track по ссылке или поисковому запросу. None при ошибке."""
         loop = asyncio.get_running_loop()
         try:
-            # extract_info блокирующий → выносим в executor, чтобы не вешать loop
+            # extract_info блокирующий → выносим в выделенный пул, чтобы не вешать loop
             data = await loop.run_in_executor(
-                None, lambda: _ytdl.extract_info(query, download=False)
+                _YTDL_EXECUTOR, lambda: _ytdl.extract_info(query, download=False)
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("[resolve] yt-dlp error for %r: %s", query, e)
@@ -127,7 +137,7 @@ class MusicPlayer:
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(
-                None,
+                _YTDL_EXECUTOR,
                 lambda: _ytdl_search.extract_info(f"ytsearch{limit}:{query}", download=False),
             )
         except Exception as e:  # noqa: BLE001
@@ -179,8 +189,11 @@ class MusicPlayer:
             self.state.current = track
 
             try:
+                # method="fallback" — если ffprobe недоступен/тормозит, не падаем,
+                # а определяем кодек запасным способом.
                 source = await discord.FFmpegOpusAudio.from_probe(
                     track.stream_url,
+                    method="fallback",
                     before_options=FFMPEG_BEFORE_OPTS,
                     options=FFMPEG_OPTS,
                 )
@@ -208,5 +221,16 @@ class MusicPlayer:
 
             # Ждём окончания трека (event выставит _after)
             await self.state.next_event.wait()
+
+            # Повтор: трек завершился — решаем его судьбу по режиму повтора.
+            # skipped=True (через /skip или кнопку) перебивает repeat-one и
+            # repeat-all для ЭТОГО трека: пропуск всегда идёт к следующему.
+            if not self.state.skipped:
+                if self.state.repeat is RepeatMode.ONE:
+                    self.state.add_front(track)   # тот же трек снова
+                elif self.state.repeat is RepeatMode.ALL:
+                    self.state.add(track)          # в конец — крутим всю очередь
+            self.state.skipped = False
+
             self.state.current = None
             await self._notify_change()  # обновить панель: трек закончился

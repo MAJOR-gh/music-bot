@@ -21,6 +21,11 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # Автоотключение при бездействии (секунды). По умолчанию 5 минут.
 IDLE_TIMEOUT: int = int(os.getenv("IDLE_TIMEOUT", "300"))
 
+# Сколько вариантов показывать в выпадающем списке текстового поиска (/play <текст>).
+# Список перелистывается по SEARCH_PAGE_SIZE штук на страницу.
+SEARCH_RESULTS: int = max(1, int(os.getenv("SEARCH_RESULTS", "25")))
+SEARCH_PAGE_SIZE: int = 10  # пунктов на странице выпадашки (Discord max — 25)
+
 # Папка с ffmpeg.exe/ffprobe.exe. Если задана — добавляем её в PATH процесса,
 # чтобы discord.py нашёл и ffmpeg, и ffprobe без правки системного PATH.
 FFMPEG_DIR: str = os.getenv("FFMPEG_DIR", "").strip()

@@ -7,8 +7,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import config
 from .player import MusicPlayer
-from .queue import GuildMusicState
+from .queue import GuildMusicState, RepeatMode
 from .track import Track
 from .ui import PlayerView, SearchView
 
@@ -131,6 +132,8 @@ class MusicCog(commands.Cog):
             if extra > 0:
                 lines.append(f"… и ещё {extra}")
             embed.add_field(name="📋 Далее в очереди", value="\n".join(lines), inline=False)
+        if state.repeat is not RepeatMode.OFF:
+            embed.set_footer(text=f"{state.repeat.emoji} Повтор: {state.repeat.label}")
         return embed
 
     async def _remove_panel(self, state: GuildMusicState) -> None:
@@ -267,14 +270,18 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(info)
             return
 
-        results = await MusicPlayer.search(query, limit=5)
+        results = await MusicPlayer.search(query, limit=config.SEARCH_RESULTS)
         if not results:
             await interaction.followup.send(f"❌ Ничего не нашёл по запросу: `{query}`")
             return
 
-        view = SearchView(self, results, requester=interaction.user.display_name)
+        view = SearchView(
+            self, results, requester=interaction.user.display_name,
+            page_size=config.SEARCH_PAGE_SIZE,
+        )
         await interaction.followup.send(
-            f"🔎 Нашёл варианты по запросу **{query}** — выбери нужный:", view=view
+            f"🔎 Нашёл {len(results)} вариантов по запросу **{query}** — выбери нужный:",
+            view=view,
         )
 
     # ── /skip ─────────────────────────────────────────────────────────────
@@ -286,6 +293,8 @@ class MusicCog(commands.Cog):
                 "❌ Сейчас ничего не играет.", ephemeral=True
             )
             return
+        # Помечаем как ручной пропуск, чтобы repeat не вернул этот трек обратно.
+        self.get_state(interaction.guild.id).skipped = True
         vc.stop()  # after-колбэк переключит на следующий трек
         await interaction.response.send_message("⏭️ Пропущено.")
 
@@ -382,6 +391,27 @@ class MusicCog(commands.Cog):
         if track.thumbnail:
             embed.set_thumbnail(url=track.thumbnail)
         await interaction.response.send_message(embed=embed)
+
+    # ── /repeat ───────────────────────────────────────────────────────────
+    @app_commands.command(name="repeat", description="Повтор: выкл / один трек / вся очередь")
+    @app_commands.describe(mode="Режим повтора (без аргумента — переключить по кругу)")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Выключить", value=int(RepeatMode.OFF)),
+        app_commands.Choice(name="Один трек", value=int(RepeatMode.ONE)),
+        app_commands.Choice(name="Вся очередь", value=int(RepeatMode.ALL)),
+    ])
+    async def repeat(
+        self, interaction: discord.Interaction,
+        mode: app_commands.Choice[int] | None = None,
+    ):
+        state = self.get_state(interaction.guild.id)
+        if mode is None:
+            new = state.cycle_repeat()           # без аргумента — по кругу
+        else:
+            state.repeat = RepeatMode(mode.value)
+            new = state.repeat
+        await self._rerender_panel(state)        # обновить футер и кнопку 🔁 на панели
+        await interaction.response.send_message(f"{new.emoji} Повтор: **{new.label}**.")
 
     # ── Авто-отключение, когда бот остался в канале один ──────────────────
     @commands.Cog.listener()

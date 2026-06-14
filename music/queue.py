@@ -3,8 +3,29 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from enum import IntEnum
 
 from .track import Track
+
+
+class RepeatMode(IntEnum):
+    """Режим повтора. OFF → ONE → ALL → OFF по кругу."""
+
+    OFF = 0   # без повтора
+    ONE = 1   # повторять текущий трек
+    ALL = 2   # повторять всю очередь (трек после проигрыша уходит в конец)
+
+    @property
+    def label(self) -> str:
+        return {
+            RepeatMode.OFF: "выкл",
+            RepeatMode.ONE: "один трек",
+            RepeatMode.ALL: "вся очередь",
+        }[self]
+
+    @property
+    def emoji(self) -> str:
+        return {RepeatMode.OFF: "🔁", RepeatMode.ONE: "🔂", RepeatMode.ALL: "🔁"}[self]
 
 
 class GuildMusicState:
@@ -24,6 +45,11 @@ class GuildMusicState:
 
         # Защита от запуска нескольких плееров на один guild
         self.player_task: asyncio.Task | None = None
+
+        # Режим повтора и флаг ручного пропуска. skipped=True означает, что трек
+        # завершился НЕ сам, а через /skip — тогда repeat-one его не возвращает.
+        self.repeat: RepeatMode = RepeatMode.OFF
+        self.skipped: bool = False
 
         # Громкость 0.0..2.0 (на будущее; FFmpegOpusAudio без PCMVolume)
         self.volume: float = 1.0
@@ -50,6 +76,11 @@ class GuildMusicState:
 
     def clear(self) -> None:
         self._queue.clear()
+
+    def cycle_repeat(self) -> RepeatMode:
+        """Переключить режим повтора OFF→ONE→ALL→OFF. Вернуть новый режим."""
+        self.repeat = RepeatMode((self.repeat + 1) % 3)
+        return self.repeat
 
     def remove(self, index: int) -> Track | None:
         """Удалить трек по индексу (0-based). None если индекс невалиден."""
