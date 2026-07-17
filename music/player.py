@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import discord
@@ -38,9 +40,12 @@ YTDL_OPTS = {
 
 # ── Настройки FFmpeg ──────────────────────────────────────────────────────────
 # reconnect-флаги критичны: прямые ссылки на поток нестабильны и рвутся.
+# rw_timeout (микросекунды) — не висеть вечно на «мёртвом» соединении:
+# на хостингах googlevideo часто не отвечает датацентровым IP, и без таймаута
+# ffmpeg молча ждёт, а бот «играет тишину».
 FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 "
-    "-reconnect_delay_max 5"
+    "-reconnect_delay_max 5 -rw_timeout 15000000"
 )
 FFMPEG_OPTS = "-vn"
 
@@ -80,6 +85,10 @@ class MusicPlayer:
         # cog обновил живую панель-плеер.
         self._on_track_change = on_track_change
         self._loop = asyncio.get_running_loop()
+        # Хостинги с датацентровыми IP часто не могут открыть прямые ссылки
+        # googlevideo (Connection timed out). Если прямой поток «умер» сразу,
+        # а режим pipe отработал — дальше идём сразу через pipe, без лишних попыток.
+        self._prefer_pipe = False
 
     async def _notify_change(self) -> None:
         if self._on_track_change is not None:
@@ -160,6 +169,72 @@ class MusicPlayer:
             ))
         return out
 
+    # ── Создание аудио-источника ──────────────────────────────────────────
+    def _spawn_pipe(self, track: Track) -> subprocess.Popen:
+        """Запустить yt-dlp, который льёт аудио в stdout (для pipe-режима).
+
+        Качает через сам yt-dlp: чанками, с обходом троттлинга и --force-ipv4 —
+        работает там, где прямая ссылка для ffmpeg недоступна (датацентровые IP).
+        """
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "-f", "bestaudio/best",
+            "--no-playlist",
+            "--force-ipv4",
+            "--quiet", "--no-warnings",
+            "-o", "-",
+            track.webpage_url,
+        ]
+        return subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+
+    @staticmethod
+    def _kill_pipe(proc: subprocess.Popen | None) -> None:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    async def _make_source(
+        self, track: Track
+    ) -> tuple[discord.AudioSource | None, bool, subprocess.Popen | None]:
+        """Создать источник звука. Возвращает (source, used_pipe, ytdlp_proc).
+
+        Сначала пробуем прямой поток (дёшево: без перекодирования, если opus).
+        Если он не открывается — переходим на pipe через yt-dlp и запоминаем
+        это в _prefer_pipe, чтобы не тратить время на мёртвый вариант дальше.
+        """
+        if not self._prefer_pipe:
+            try:
+                # from_probe (ffprobe) точно определяет кодек: если это opus,
+                # FFmpeg копирует поток без перекодирования (дёшево).
+                source = await discord.FFmpegOpusAudio.from_probe(
+                    track.stream_url,
+                    before_options=FFMPEG_BEFORE_OPTS,
+                    options=FFMPEG_OPTS,
+                )
+                return source, False, None
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[player_loop] прямой поток не открылся (%s) — "
+                    "переключаюсь на yt-dlp pipe", e,
+                )
+                self._prefer_pipe = True
+
+        try:
+            proc = self._spawn_pipe(track)
+            # Без from_probe: пайп нельзя «прощупать» дважды. FFmpeg сам
+            # перекодирует в opus — чуть дороже по CPU, зато надёжно.
+            source = discord.FFmpegOpusAudio(
+                proc.stdout, pipe=True, options=FFMPEG_OPTS
+            )
+            return source, True, proc
+        except Exception as e:  # noqa: BLE001
+            logger.error("[player_loop] pipe source error: %s", e)
+            return None, True, None
+
     # ── Основной цикл воспроизведения ─────────────────────────────────────
     async def player_loop(self) -> None:
         """Берёт треки из очереди и проигрывает их по очереди.
@@ -188,18 +263,9 @@ class MusicPlayer:
 
             self.state.current = track
 
-            try:
-                # from_probe (метод по умолчанию — ffprobe) точно определяет кодек:
-                # если это opus, FFmpeg копирует поток без перекодирования (дёшево).
-                # Не форсируем fallback — он может ошибиться с кодеком и вызвать
-                # постоянное перекодирование → нагрузка на CPU и заикания.
-                source = await discord.FFmpegOpusAudio.from_probe(
-                    track.stream_url,
-                    before_options=FFMPEG_BEFORE_OPTS,
-                    options=FFMPEG_OPTS,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.error("[player_loop] FFmpeg source error: %s", e)
+            source, used_pipe, pipe_proc = await self._make_source(track)
+            if source is None:
+                logger.error("[player_loop] FFmpeg source error, skip %r", track.title)
                 self.state.current = None
                 continue
 
@@ -210,18 +276,41 @@ class MusicPlayer:
                 self._loop.call_soon_threadsafe(self.state.next_event.set)
 
             if not self.voice_client.is_connected():
+                self._kill_pipe(pipe_proc)
                 logger.info("[player_loop] voice disconnected, stopping loop")
                 return
 
+            started_at = self._loop.time()
             self.voice_client.play(source, after=_after)
             logger.info(
-                "[player_loop] now playing %r on guild %s",
+                "[player_loop] now playing %r on guild %s%s",
                 track.title, self.state.guild_id,
+                " (yt-dlp pipe)" if used_pipe else "",
             )
             await self._notify_change()  # обновить панель: заиграл новый трек
 
             # Ждём окончания трека (event выставит _after)
             await self.state.next_event.wait()
+            self._kill_pipe(pipe_proc)
+
+            played = self._loop.time() - started_at
+            # «Молчащий бот»: прямой поток открылся, но умер почти сразу
+            # (датацентровый IP, Connection timed out). Не считаем трек
+            # отыгранным — пробуем его же ещё раз, уже через yt-dlp pipe.
+            if (
+                not used_pipe
+                and not self.state.skipped
+                and played < 5
+                and (track.duration or 999) > 10
+            ):
+                logger.warning(
+                    "[player_loop] трек оборвался за %.1fс — повтор через pipe",
+                    played,
+                )
+                self._prefer_pipe = True
+                self.state.add_front(track)
+                self.state.current = None
+                continue
 
             # Повтор: трек завершился — решаем его судьбу по режиму повтора.
             # skipped=True (через /skip или кнопку) перебивает repeat-one и
