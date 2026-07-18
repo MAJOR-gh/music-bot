@@ -7,6 +7,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+import aiohttp
 import discord
 import yt_dlp
 
@@ -36,6 +37,11 @@ YTDL_OPTS = {
     # ВНИМАНИЕ: не форсируем player_client. Принудительный android-клиент YouTube
     # отдаёт throttled-потоки → музыка лагает/заикается. Пусть yt-dlp сам выбирает
     # лучший рабочий клиент — так поток стабильнее.
+    # YouTube теперь требует JS-рантайм для решения sig/n-challenge; без него
+    # yt-dlp отдаёт тротлённые или «мёртвые» ссылки — трек обрывается через
+    # пару секунд, бот молчит. Разрешаем deno (дефолт) и node (стоит у нас);
+    # солвер ставится пакетом yt-dlp-ejs (см. requirements.txt).
+    "js_runtimes": {"deno": {}, "node": {}},
 }
 
 # ── Настройки FFmpeg ──────────────────────────────────────────────────────────
@@ -61,6 +67,13 @@ YTDL_SEARCH_OPTS = {
 }
 _ytdl_search = yt_dlp.YoutubeDL(YTDL_SEARCH_OPTS)
 
+# Глобальный (на процесс) флаг «прямые ссылки googlevideo не работают».
+# Раньше жил в экземпляре MusicPlayer и сбрасывался при каждом переподключении
+# к войсу — бот заново наступал на те же грабли (30+ секунд таймаутов ffprobe/
+# ffmpeg на каждый первый трек). Сеть хостинга за время жизни процесса не
+# меняется, так что запоминаем один раз.
+_PREFER_PIPE = False
+
 
 class MusicPlayer:
     """Управляет воспроизведением для одного сервера.
@@ -85,10 +98,25 @@ class MusicPlayer:
         # cog обновил живую панель-плеер.
         self._on_track_change = on_track_change
         self._loop = asyncio.get_running_loop()
-        # Хостинги с датацентровыми IP часто не могут открыть прямые ссылки
-        # googlevideo (Connection timed out). Если прямой поток «умер» сразу,
-        # а режим pipe отработал — дальше идём сразу через pipe, без лишних попыток.
-        self._prefer_pipe = False
+
+    @staticmethod
+    async def _stream_reachable(url: str) -> bool:
+        """Быстрая проверка (≤4с), открывается ли прямая ссылка googlevideo.
+
+        Обязательна перед from_probe: на мёртвой ссылке ffprobe висит до 20с,
+        а fallback-проба discord.py «успешно» возвращает дефолтный кодек —
+        источник создаётся, ffmpeg умирает, и бот молчит. Дешевле спросить
+        1 КБ по HTTP заранее, чем терять полминуты на таймауты.
+        """
+        try:
+            timeout = aiohttp.ClientTimeout(total=4)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url, headers={"Range": "bytes=0-1023"}
+                ) as resp:
+                    return resp.status in (200, 206)
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _notify_change(self) -> None:
         if self._on_track_change is not None:
@@ -181,6 +209,8 @@ class MusicPlayer:
             "-f", "bestaudio/best",
             "--no-playlist",
             "--force-ipv4",
+            "--js-runtimes", "deno",
+            "--js-runtimes", "node",
             "--quiet", "--no-warnings",
             "-o", "-",
             track.webpage_url,
@@ -204,9 +234,18 @@ class MusicPlayer:
 
         Сначала пробуем прямой поток (дёшево: без перекодирования, если opus).
         Если он не открывается — переходим на pipe через yt-dlp и запоминаем
-        это в _prefer_pipe, чтобы не тратить время на мёртвый вариант дальше.
+        это в _PREFER_PIPE (глобально на процесс), чтобы не тратить время
+        на мёртвый вариант при каждом треке/переподключении.
         """
-        if not self._prefer_pipe:
+        global _PREFER_PIPE
+        if not _PREFER_PIPE:
+            if not await self._stream_reachable(track.stream_url):
+                logger.warning(
+                    "[player_loop] прямая ссылка googlevideo недоступна "
+                    "(датацентровый IP?) — переключаюсь на yt-dlp pipe"
+                )
+                _PREFER_PIPE = True
+        if not _PREFER_PIPE:
             try:
                 # from_probe (ffprobe) точно определяет кодек: если это opus,
                 # FFmpeg копирует поток без перекодирования (дёшево).
@@ -221,7 +260,7 @@ class MusicPlayer:
                     "[player_loop] прямой поток не открылся (%s) — "
                     "переключаюсь на yt-dlp pipe", e,
                 )
-                self._prefer_pipe = True
+                _PREFER_PIPE = True
 
         try:
             proc = self._spawn_pipe(track)
@@ -307,7 +346,8 @@ class MusicPlayer:
                     "[player_loop] трек оборвался за %.1fс — повтор через pipe",
                     played,
                 )
-                self._prefer_pipe = True
+                global _PREFER_PIPE
+                _PREFER_PIPE = True
                 self.state.add_front(track)
                 self.state.current = None
                 continue

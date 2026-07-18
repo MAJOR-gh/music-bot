@@ -1,7 +1,9 @@
 FROM python:3.13-slim
 
-# ffmpeg нужен discord.py для проигрывания/перекодирования звука
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+# ffmpeg нужен discord.py для проигрывания/перекодирования звука.
+# nodejs — JS-рантайм для yt-dlp: YouTube требует решать sig/n-challenge,
+# без рантайма ссылки на поток «мёртвые» и музыка обрывается сразу.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
