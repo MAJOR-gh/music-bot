@@ -34,6 +34,13 @@ class MusicBot(commands.Bot):
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
 
+            # Снимок команд ДО синка — чтобы в логах показать, что изменилось
+            # этим деплоем (появились ли новые команды, пропали ли старые).
+            try:
+                before = {c.name for c in await self.tree.fetch_commands(guild=guild)}
+            except discord.HTTPException:
+                before = set()
+
             # Железобетонная защита от дублей в списке команд. Команда в Discord
             # «двоится», когда у приложения одновременно есть ГЛОБАЛЬНАЯ и
             # ГИЛЬДИЙНАЯ копии одной команды (типичное наследие старого деплоя,
@@ -51,9 +58,20 @@ class MusicBot(commands.Bot):
             # 3) Пушим гильдийные — появляются мгновенно и в одном экземпляре.
             synced = await self.tree.sync(guild=guild)
             logger.info(
-                "Синхронизировано %d гильдийных команд для guild %s",
+                "Синхронизировано %d гильдийных команд для guild %s: %s",
                 len(synced), config.GUILD_ID,
+                ", ".join(sorted(c.name for c in synced)),
             )
+
+            # Дифф с прошлым запуском — что именно добавил/убрал этот деплой.
+            after = {c.name for c in synced}
+            added, removed = after - before, before - after
+            if added:
+                logger.info("🆕 Новые команды: %s", ", ".join(sorted(added)))
+            if removed:
+                logger.info("🗑️ Удалены команды: %s", ", ".join(sorted(removed)))
+            if not added and not removed:
+                logger.info("Состав команд не изменился")
         else:
             # Глобальный режим: чистим возможные гильдийные остатки нельзя без
             # списка гильдий, но глобальный sync сам приводит глобальную область
