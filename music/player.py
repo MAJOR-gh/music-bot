@@ -11,6 +11,7 @@ import aiohttp
 import discord
 import yt_dlp
 
+import config
 from .queue import GuildMusicState, RepeatMode
 from .track import SearchResult, Track
 
@@ -71,8 +72,9 @@ _ytdl_search = yt_dlp.YoutubeDL(YTDL_SEARCH_OPTS)
 # Раньше жил в экземпляре MusicPlayer и сбрасывался при каждом переподключении
 # к войсу — бот заново наступал на те же грабли (30+ секунд таймаутов ffprobe/
 # ffmpeg на каждый первый трек). Сеть хостинга за время жизни процесса не
-# меняется, так что запоминаем один раз.
-_PREFER_PIPE = False
+# меняется, так что запоминаем один раз. FORCE_PIPE=1 в .env выставляет его
+# сразу — на датацентровых IP не тратим ни одной попытки на прямые ссылки.
+_PREFER_PIPE = config.FORCE_PIPE
 
 
 class MusicPlayer:
@@ -336,11 +338,13 @@ class MusicPlayer:
             # «Молчащий бот»: прямой поток открылся, но умер почти сразу
             # (датацентровый IP, Connection timed out). Не считаем трек
             # отыгранным — пробуем его же ещё раз, уже через yt-dlp pipe.
+            # Порог 12с: ffmpeg с rw_timeout=15s умирает на мёртвой ссылке
+            # за ~5с — старый порог <5 такие случаи пропускал впритык.
             if (
                 not used_pipe
                 and not self.state.skipped
-                and played < 5
-                and (track.duration or 999) > 10
+                and played < 12
+                and (track.duration or 999) > 30
             ):
                 logger.warning(
                     "[player_loop] трек оборвался за %.1fс — повтор через pipe",

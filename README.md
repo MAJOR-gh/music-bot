@@ -153,6 +153,7 @@ python main.py
 | Симптом | Причина / решение |
 |---|---|
 | Бот заходит в канал, но тишина | FFmpeg не в PATH — проверь `ffmpeg -version` |
+| На хостинге трек «начинается» и тут же пропадает (Connection timed out к googlevideo) | Датацентровый IP заблокирован YouTube — поставь `FORCE_PIPE=1` в `.env`: аудио пойдёт через yt-dlp pipe, минуя прямые ссылки |
 | `/play` не находит команды | Подожди (глобальная синхр.) или задай `GUILD_ID` |
 | `Could not find PyNaCl` | `pip install PyNaCl` |
 | Трек обрывается | yt-dlp устарел: `pip install -U yt-dlp` |

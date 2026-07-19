@@ -26,6 +26,11 @@ IDLE_TIMEOUT: int = int(os.getenv("IDLE_TIMEOUT", "300"))
 SEARCH_RESULTS: int = max(1, int(os.getenv("SEARCH_RESULTS", "25")))
 SEARCH_PAGE_SIZE: int = 10  # пунктов на странице выпадашки (Discord max — 25)
 
+# Форсировать yt-dlp pipe (минуя прямые ссылки googlevideo). Ставь 1 на
+# хостинге с датацентровым IP: googlevideo такие IP режет, прямой поток
+# умирает через пару секунд, и бот молчит/панель исчезает.
+FORCE_PIPE: bool = os.getenv("FORCE_PIPE", "").strip().lower() in ("1", "true", "yes")
+
 # Папка с ffmpeg.exe/ffprobe.exe. Если задана — добавляем её в PATH процесса,
 # чтобы discord.py нашёл и ffmpeg, и ffprobe без правки системного PATH.
 FFMPEG_DIR: str = os.getenv("FFMPEG_DIR", "").strip()
