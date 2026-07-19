@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 import sys
+import tempfile
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
@@ -200,13 +203,13 @@ class MusicPlayer:
         return out
 
     # ── Создание аудио-источника ──────────────────────────────────────────
-    def _spawn_pipe(self, track: Track) -> subprocess.Popen:
-        """Запустить yt-dlp, который льёт аудио в stdout (для pipe-режима).
+    # Треки длиннее этого лимита не кэшируем на диск (стримим через pipe),
+    # чтобы не забивать диск часовыми сетами. None-длительность = прямой эфир.
+    _MAX_CACHE_DURATION = 60 * 60  # 1 час
 
-        Качает через сам yt-dlp: чанками, с обходом троттлинга и --force-ipv4 —
-        работает там, где прямая ссылка для ffmpeg недоступна (датацентровые IP).
-        """
-        cmd = [
+    def _ytdlp_cmd(self, track: Track) -> list[str]:
+        """Общая команда yt-dlp: аудио в stdout."""
+        return [
             sys.executable, "-m", "yt_dlp",
             "-f", "bestaudio/best",
             "--no-playlist",
@@ -217,9 +220,51 @@ class MusicPlayer:
             "-o", "-",
             track.webpage_url,
         ]
+
+    def _spawn_pipe(self, track: Track) -> subprocess.Popen:
+        """Запустить yt-dlp, который льёт аудио в stdout (для pipe-режима).
+
+        Качает через сам yt-dlp: чанками, с обходом троттлинга и --force-ipv4 —
+        работает там, где прямая ссылка для ffmpeg недоступна (датацентровые IP).
+        """
         return subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            self._ytdlp_cmd(track), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
         )
+
+    def _download_blocking(self, track: Track) -> str | None:
+        """Скачать аудио целиком во временный файл. Вернуть путь или None.
+
+        Вызывается в executor (блокирующий subprocess). Играть с диска, а не
+        из живого пайпа, критично против «ускорений»: плеер шлёт фреймы каждые
+        20 мс, и любая сетевая задержка чтения копится, а потом фреймы уходят
+        пачкой без пауз — слушается как перемотка. Диск задержек не даёт.
+        """
+        path = os.path.join(
+            tempfile.gettempdir(), f"musicbot-{uuid.uuid4().hex}.audio"
+        )
+        try:
+            with open(path, "wb") as f:
+                proc = subprocess.run(
+                    self._ytdlp_cmd(track), stdout=f,
+                    stderr=subprocess.DEVNULL, timeout=300,
+                )
+            if proc.returncode == 0 and os.path.getsize(path) > 0:
+                return path
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[download] %r: %s", track.title, e)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def _remove_file(path: str | None) -> None:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     @staticmethod
     def _kill_pipe(proc: subprocess.Popen | None) -> None:
@@ -231,13 +276,17 @@ class MusicPlayer:
 
     async def _make_source(
         self, track: Track
-    ) -> tuple[discord.AudioSource | None, bool, subprocess.Popen | None]:
-        """Создать источник звука. Возвращает (source, used_pipe, ytdlp_proc).
+    ) -> tuple[discord.AudioSource | None, bool, subprocess.Popen | None, str | None]:
+        """Создать источник звука. Возвращает (source, used_pipe, ytdlp_proc, tmp_path).
 
         Сначала пробуем прямой поток (дёшево: без перекодирования, если opus).
-        Если он не открывается — переходим на pipe через yt-dlp и запоминаем
-        это в _PREFER_PIPE (глобально на процесс), чтобы не тратить время
-        на мёртвый вариант при каждом треке/переподключении.
+        Если он не открывается — переходим на yt-dlp и запоминаем это в
+        _PREFER_PIPE (глобально на процесс), чтобы не тратить время на мёртвый
+        вариант при каждом треке/переподключении.
+
+        В yt-dlp-режиме обычный трек сначала качается целиком во временный файл
+        и играется с диска — иначе сетевой джиттер пайпа слышен как «ускорения».
+        Живой пайп остаётся только для стримов и очень длинных треков.
         """
         global _PREFER_PIPE
         if not _PREFER_PIPE:
@@ -256,13 +305,34 @@ class MusicPlayer:
                     before_options=FFMPEG_BEFORE_OPTS,
                     options=FFMPEG_OPTS,
                 )
-                return source, False, None
+                return source, False, None, None
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "[player_loop] прямой поток не открылся (%s) — "
                     "переключаюсь на yt-dlp pipe", e,
                 )
                 _PREFER_PIPE = True
+
+        # Обычный трек известной длины → скачать целиком и играть с диска.
+        if track.duration and track.duration <= self._MAX_CACHE_DURATION:
+            path = await self._loop.run_in_executor(
+                _YTDL_EXECUTOR, self._download_blocking, track
+            )
+            if path is not None:
+                try:
+                    source = await discord.FFmpegOpusAudio.from_probe(
+                        path, options=FFMPEG_OPTS
+                    )
+                    return source, True, None, path
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[player_loop] файл не открылся (%s) — живой pipe", e
+                    )
+                    self._remove_file(path)
+            else:
+                logger.warning(
+                    "[player_loop] скачивание не удалось — живой pipe"
+                )
 
         try:
             proc = self._spawn_pipe(track)
@@ -271,10 +341,10 @@ class MusicPlayer:
             source = discord.FFmpegOpusAudio(
                 proc.stdout, pipe=True, options=FFMPEG_OPTS
             )
-            return source, True, proc
+            return source, True, proc, None
         except Exception as e:  # noqa: BLE001
             logger.error("[player_loop] pipe source error: %s", e)
-            return None, True, None
+            return None, True, None, None
 
     # ── Основной цикл воспроизведения ─────────────────────────────────────
     async def player_loop(self) -> None:
@@ -304,7 +374,7 @@ class MusicPlayer:
 
             self.state.current = track
 
-            source, used_pipe, pipe_proc = await self._make_source(track)
+            source, used_pipe, pipe_proc, tmp_path = await self._make_source(track)
             if source is None:
                 logger.error("[player_loop] FFmpeg source error, skip %r", track.title)
                 self.state.current = None
@@ -318,6 +388,7 @@ class MusicPlayer:
 
             if not self.voice_client.is_connected():
                 self._kill_pipe(pipe_proc)
+                self._remove_file(tmp_path)
                 logger.info("[player_loop] voice disconnected, stopping loop")
                 return
 
@@ -333,6 +404,7 @@ class MusicPlayer:
             # Ждём окончания трека (event выставит _after)
             await self.state.next_event.wait()
             self._kill_pipe(pipe_proc)
+            self._remove_file(tmp_path)
 
             played = self._loop.time() - started_at
             # «Молчащий бот»: прямой поток открылся, но умер почти сразу
