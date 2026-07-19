@@ -9,3 +9,5 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+pipe_err.txt
+local_run.log

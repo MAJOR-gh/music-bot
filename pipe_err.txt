@@ -1,3 +1,0 @@
-
-
-ERROR: unable to write data: [Errno 32] Broken pipe
