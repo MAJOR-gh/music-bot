@@ -1,13 +1,18 @@
 """MusicCog: слэш-команды управления музыкой."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import shutil
+import time
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 import config
+from . import player as player_module
 from .player import MusicPlayer
 from .queue import GuildMusicState, RepeatMode
 from .track import Track
@@ -412,6 +417,67 @@ class MusicCog(commands.Cog):
             new = state.repeat
         await self._rerender_panel(state)        # обновить футер и кнопку 🔁 на панели
         await interaction.response.send_message(f"{new.emoji} Повтор: **{new.label}**.")
+
+    # ── /ping ─────────────────────────────────────────────────────────────
+    @staticmethod
+    async def _http_ping(url: str) -> float | None:
+        """Время HTTP GET-запроса (мс) или None, если не ответил за 5с."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            start = time.perf_counter()
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    await resp.read()
+                    if resp.status >= 500:
+                        return None
+            return (time.perf_counter() - start) * 1000
+        except Exception:  # noqa: BLE001
+            return None
+
+    @app_commands.command(name="ping", description="Сервисная проверка: задержки, FFmpeg, режим доставки звука")
+    async def ping(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        def fmt(ms: float | None) -> str:
+            return f"`{ms:.0f} мс`" if ms is not None else "❌ недоступен"
+
+        # Пинги наружу — параллельно, чтобы команда отвечала быстро.
+        youtube_ms, google_ms = await asyncio.gather(
+            self._http_ping("https://www.youtube.com/generate_204"),
+            self._http_ping("https://www.google.com/generate_204"),
+        )
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        vc = interaction.guild.voice_client
+        state = self.get_state(interaction.guild.id)
+
+        embed = discord.Embed(title="🏓 Понг! Диагностика", color=0x5865F2)
+        embed.add_field(
+            name="Discord Gateway",
+            value=f"`{self.bot.latency * 1000:.0f} мс`",
+            inline=True,
+        )
+        embed.add_field(name="YouTube", value=fmt(youtube_ms), inline=True)
+        embed.add_field(name="Google", value=fmt(google_ms), inline=True)
+        embed.add_field(
+            name="FFmpeg",
+            value="✅ найден" if ffmpeg_path else "❌ не найден в PATH",
+            inline=True,
+        )
+        embed.add_field(
+            name="Доставка звука",
+            value="📦 yt-dlp (скачивание)" if player_module._PREFER_PIPE
+                  else "🔗 прямой поток",
+            inline=True,
+        )
+        embed.add_field(
+            name="Голосовой канал",
+            value=f"🔊 {vc.channel.name}" if vc and vc.is_connected() else "—",
+            inline=True,
+        )
+        if state.current:
+            embed.set_footer(text=f"Сейчас играет: {state.current.title}")
+        await interaction.followup.send(embed=embed)
 
     # ── Авто-отключение, когда бот остался в канале один ──────────────────
     @commands.Cog.listener()
