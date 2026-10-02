@@ -1,8 +1,8 @@
 # 🎵 Discord Music Bot
 
 Личный музыкальный бот для Discord на **discord.py 2.x** + **yt-dlp** + **FFmpeg**.
-Стримит аудио напрямую (без скачивания на диск), поддерживает YouTube, SoundCloud
-и текстовый поиск. Очередь — отдельная для каждого сервера.
+Играет YouTube, SoundCloud и ссылки Spotify, ищет по YouTube, YouTube Music,
+Spotify и Last.fm. Очередь — отдельная для каждого сервера.
 
 ## Возможности
 
@@ -10,7 +10,7 @@
 |---|---|
 | `/join` | Подключиться к твоему голосовому каналу (или переместиться в него) |
 | `/leave` | Отключиться и очистить очередь |
-| `/play <запрос>` | Играть по ссылке (YouTube/SoundCloud) или искать по тексту (перелистываемый список вариантов) |
+| `/play <запрос> [source]` | Играть по ссылке (YouTube/SoundCloud/Spotify — трек, альбом, плейлист) или искать по тексту; `source` — где искать: YouTube, YouTube Music, Spotify, Last.fm |
 | `/skip` | Пропустить текущий трек |
 | `/repeat [режим]` | Повтор: выкл / один трек / вся очередь (без аргумента — по кругу) |
 | `/pause` | Пауза |
@@ -18,7 +18,7 @@
 | `/stop` | Остановить и очистить очередь (бот остаётся в канале) |
 | `/queue` | Показать очередь |
 | `/nowplaying` | Что играет сейчас |
-| `/ping` | Сервисная диагностика: задержка Discord, пинг YouTube/Google, FFmpeg, режим доставки звука |
+| `/ping` | Сервисная диагностика: задержка Discord, пинг YouTube/Google, FFmpeg, режим доставки звука, версия yt-dlp |
 
 Дополнительно:
 - 🔎 Текстовый поиск показывает до 25 вариантов (`SEARCH_RESULTS`), список
@@ -27,7 +27,17 @@
 - ⏱️ Авто-отключение через 5 минут бездействия (настраивается `IDLE_TIMEOUT`).
 - 👥 Авто-отключение, если в канале не осталось людей.
 - 🔒 Защита от запуска нескольких плееров на один сервер.
-- 🔁 Авто-переход к следующему треку, авто-reconnect потока FFmpeg.
+- ⏩ Следующий трек качается заранее, пока играет текущий, — без пауз между треками.
+- 🔌 Если сеть/туннель моргнули — бот переподключает голос сам, а не вылетает из канала.
+- ⬆️ yt-dlp обновляется сам (при старте и раз в 12 часов) — меньше 403 от YouTube.
+- 🎧 Если YouTube не отдал трек — бот ищет ту же песню на SoundCloud.
+
+### Spotify и Last.fm
+Звук всегда берётся с YouTube/SoundCloud. Spotify и Last.fm дают только «что за
+трек», а бот перед игрой находит его на YouTube Music.
+- **Ссылки Spotify** (трек/альбом/плейлист) работают без ключей.
+- **Поиск** по Spotify/Last.fm требует ключей в `.env` (`SPOTIFY_CLIENT_ID` +
+  `SPOTIFY_CLIENT_SECRET`, `LASTFM_API_KEY`) — см. `.env.example`.
 
 ## Структура проекта
 
@@ -38,23 +48,29 @@ music_bot/
 ├── requirements.txt
 ├── .env.example
 ├── README.md
+├── test_bot.py         # офлайн-тесты: python test_bot.py
 └── music/
     ├── __init__.py
-    ├── track.py        # dataclass Track
+    ├── track.py        # dataclass Track / SearchResult
     ├── queue.py        # GuildMusicState — очередь и состояние сервера
-    ├── player.py       # MusicPlayer — yt-dlp + цикл воспроизведения
+    ├── player.py       # MusicPlayer — подготовка треков, предзагрузка, цикл воспроизведения
+    ├── ytdl.py         # yt-dlp в отдельных процессах (поиск, метаданные, скачивание)
+    ├── sources.py      # поиск: YouTube, YouTube Music, Spotify, Last.fm, SoundCloud
+    ├── updater.py      # автообновление yt-dlp
+    ├── ui.py           # кнопки панели и выпадающий список поиска
     └── cog.py          # MusicCog — слэш-команды
 ```
 
 ## Архитектура
 
-- **`Track`** (`track.py`) — `@dataclass(slots=True)`: метаданные трека и прямой
-  URL аудиопотока (получен через `yt-dlp` с `download=False`).
+- **`Track`** (`track.py`) — `@dataclass(slots=True)`: метаданные трека и ссылка
+  на его страницу. У треков из Spotify/Last.fm ссылки нет — её найдёт плеер.
 - **`GuildMusicState`** (`queue.py`) — очередь (`deque`), текущий трек,
   `asyncio.Event` для управления плеером. Один экземпляр на сервер.
-- **`MusicPlayer`** (`player.py`) — извлекает поток через `yt-dlp` (в executor,
-  чтобы не блокировать event loop) и крутит `player_loop`, проигрывая треки через
-  `discord.FFmpegOpusAudio`.
+- **`MusicPlayer`** (`player.py`) — готовит трек (находит на YT Music, качает
+  через `yt-dlp` во временный файл) и крутит `player_loop`, проигрывая треки через
+  `discord.FFmpegOpusAudio`. yt-dlp работает отдельными процессами (`ytdl.py`),
+  поэтому не тормозит отправку звука.
 - **`MusicCog`** (`cog.py`) — слэш-команды и словарь состояний по серверам.
 
 ---
@@ -157,5 +173,6 @@ python main.py
 | На хостинге трек «начинается» и тут же пропадает (Connection timed out к googlevideo) | Датацентровый IP заблокирован YouTube — поставь `FORCE_PIPE=1` в `.env`: аудио пойдёт через yt-dlp pipe, минуя прямые ссылки |
 | `/play` не находит команды | Подожди (глобальная синхр.) или задай `GUILD_ID` |
 | `Could not find PyNaCl` | `pip install PyNaCl` |
-| Трек обрывается | yt-dlp устарел: `pip install -U yt-dlp` |
-| `403 / Sign in to confirm` от YouTube | Обнови yt-dlp; YouTube периодически меняет защиту |
+| Трек обрывается | yt-dlp устарел — бот обновляет его сам; вручную: `pip install -U yt-dlp` |
+| `403 / Sign in to confirm` от YouTube | Обнови yt-dlp; если не помогло — положи `cookies.txt` аккаунта YouTube рядом с ботом |
+| «Поиск по Spotify не настроен» | Впиши ключи Spotify в `.env` или ищи через YouTube Music (ссылки Spotify работают и так) |

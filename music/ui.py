@@ -1,7 +1,7 @@
 """UI-компоненты: живая панель-плеер (кнопки) и выпадающий список поиска.
 
-PlayerView  — кнопки Пауза/Продолжить/Пропустить/Стоп под эмбедом «сейчас играет».
-SearchView  — выпадающий список топ-N вариантов текстового поиска.
+PlayerView  — кнопки ⏮️/Пауза/Продолжить/Пропустить/Повтор/Стоп под эмбедом «сейчас играет».
+SearchView  — выпадающий список вариантов текстового поиска.
 
 Сами действия (пауза, пропуск, постановка в очередь, обновление панели) живут в
 MusicCog — здесь только разметка и проброс кликов в cog, чтобы не дублировать логику.
@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from .player import MusicPlayer
 from .track import SearchResult
 
 if TYPE_CHECKING:
@@ -47,12 +46,10 @@ class PlayerView(discord.ui.View):
 
     @discord.ui.button(emoji="⏮️", label="В начало", style=discord.ButtonStyle.secondary)
     async def restart_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = self._vc(interaction)
-        if vc and (vc.is_playing() or vc.is_paused()):
-            # Перезапуск с начала: cog кладёт трек в начало очереди и обрывает
-            # текущий. Панель обновится сама через on_track_change.
+        # Перезапуск с начала: cog кладёт трек в начало очереди и обрывает
+        # текущий. Панель обновится сама через on_track_change.
+        if self.cog.restart_current(interaction.guild):
             await interaction.response.defer()
-            self.cog.restart_current(self.guild_id, vc)
         else:
             await interaction.response.send_message("❌ Сейчас ничего не играет.", ephemeral=True)
 
@@ -76,14 +73,9 @@ class PlayerView(discord.ui.View):
 
     @discord.ui.button(emoji="⏭️", label="Пропустить", style=discord.ButtonStyle.primary)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = self._vc(interaction)
-        if vc and (vc.is_playing() or vc.is_paused()):
-            # vc.stop() → сработает after-колбэк плеера → новый трек → панель
-            # обновится сама через on_track_change. Здесь только подтверждаем клик.
-            # Помечаем ручной пропуск, чтобы repeat не вернул этот трек обратно.
-            self.cog.get_state(self.guild_id).skipped = True
+        # Плеер возьмёт следующий трек и сам перевыложит панель (on_track_change).
+        if self.cog.skip(interaction.guild):
             await interaction.response.defer()
-            vc.stop()
         else:
             await interaction.response.send_message("❌ Нечего пропускать.", ephemeral=True)
 
@@ -96,15 +88,13 @@ class PlayerView(discord.ui.View):
 
     @discord.ui.button(emoji="⏹️", label="Стоп", style=discord.ButtonStyle.danger, row=1)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = self._vc(interaction)
-        if vc is None:
+        if self._vc(interaction) is None:
             await interaction.response.send_message("❌ Я не в голосовом канале.", ephemeral=True)
             return
+        self.cog.stop_all(interaction.guild)
         state = self.cog.get_state(self.guild_id)
-        state.clear()
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-        state.panel_message = None
+        if state.panel_message is not None and state.panel_message.id == interaction.message.id:
+            state.panel_message = None   # это сообщение превращаем в «Остановлено», не удаляем
         await interaction.response.edit_message(
             content="⏹️ Остановлено, очередь очищена.", embed=None, view=None
         )
@@ -127,23 +117,23 @@ class SearchSelect(discord.ui.Select):
         view = self.parent_view
         chosen = view.results[int(self.values[0])]
 
-        # Полный поток добываем только сейчас — для выбранного варианта.
-        track = await MusicPlayer.resolve(chosen.url, requester=view.requester)
-        if track is None:
+        # Звук не добываем здесь: плеер сам найдёт/скачает трек перед игрой.
+        track = chosen.to_track(requester=interaction.user.display_name)
+        was_idle = await view.cog.enqueue(interaction, [track])
+        if was_idle is None:
             await interaction.edit_original_response(
-                content="❌ Не удалось загрузить выбранный трек.", view=None
+                content="❌ Не удалось подключиться к голосовому каналу.", view=None
             )
-            return
-
-        ok, info = await view.cog.enqueue_from_interaction(interaction, track)
-        if not ok:
-            await interaction.edit_original_response(content=info, view=None)
+            view.stop()
             return
 
         # Гасим всё после выбора, показываем что добавили.
         for child in view.children:
             child.disabled = True
-        await interaction.edit_original_response(content=info, view=view)
+        view.stop()
+        await interaction.edit_original_response(
+            content=view.cog.enqueue_message(was_idle, track), view=view
+        )
 
 
 class SearchView(discord.ui.View):
@@ -160,10 +150,20 @@ class SearchView(discord.ui.View):
         self.page_size = page_size
         self.page = 0
         self.pages = max(1, (len(results) + page_size - 1) // page_size)
+        self.message: discord.Message | None = None  # сообщение со списком (для таймаута)
 
         self.select = SearchSelect(self)
         self.add_item(self.select)
         self._build()
+
+    @staticmethod
+    def _describe(r: SearchResult) -> str:
+        parts = [f"[{r.duration_str}]"]
+        if r.uploader:
+            parts.append(r.uploader)
+        if r.note:
+            parts.append(r.note)
+        return " • ".join(parts)[:100]
 
     def _build(self) -> None:
         """Пересобрать опции select и состояние навигации под текущую страницу."""
@@ -171,9 +171,8 @@ class SearchView(discord.ui.View):
         items = self.results[start:start + self.page_size]
         self.select.options = [
             discord.SelectOption(
-                label=r.title[:100],
-                description=f"[{r.duration_str}]"
-                            f"{f' • {r.uploader}' if r.uploader else ''}"[:100],
+                label=(r.title or "Unknown")[:100],
+                description=self._describe(r),
                 value=str(start + offset),
                 emoji="🎵",
             )
@@ -206,5 +205,13 @@ class SearchView(discord.ui.View):
         await interaction.response.edit_message(view=self)
 
     async def on_timeout(self) -> None:
+        # Без правки сообщения список выглядел бы живым, а клик давал
+        # «Ошибка взаимодействия». Гасим его и в самом сообщении.
         for child in self.children:
             child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(content=f"{self.message.content}\n⌛ Время выбора вышло.",
+                                        view=self)
+            except discord.HTTPException:
+                pass

@@ -1,13 +1,17 @@
 """Точка входа: настройка бота, логирования и синхронизация слэш-команд."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 import config
+from music import updater
 from music.cog import setup_cog
+from music.player import cleanup_stale_files
 
 # ── Логирование ───────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -26,9 +30,34 @@ intents.guilds = True
 
 class MusicBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+        # Текстовых команд нет — только слэш. when_mentioned убирает ложное
+        # предупреждение «Privileged message content intent is missing».
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        self._updater_task: asyncio.Task | None = None
+        self.tree.on_error = self._on_app_command_error
+
+    async def _on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """Любая ошибка в команде: в лог с трейсбеком, человеку — понятный ответ."""
+        name = interaction.command.name if interaction.command else "?"
+        logger.error("Ошибка в /%s", name, exc_info=error)
+        text = "❌ Что-то пошло не так. Подробности — в консоли бота."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     async def setup_hook(self) -> None:
+        removed = cleanup_stale_files()
+        if removed:
+            logger.info("Удалено %d временных файлов от прошлого запуска", removed)
+        if config.YTDLP_AUTO_UPDATE:
+            self._updater_task = asyncio.create_task(updater.updater_loop())
+
         await setup_cog(self, config.IDLE_TIMEOUT)
 
         if config.GUILD_ID:

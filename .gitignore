@@ -11,3 +11,6 @@ venv/
 .venv/
 pipe_err.txt
 local_run.log
+
+# Куки YouTube-аккаунта — секрет
+cookies.txt

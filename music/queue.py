@@ -40,22 +40,23 @@ class GuildMusicState:
         self._queue: deque[Track] = deque()
         self.current: Track | None = None
 
-        # Сигнал плееру, что появился новый трек / можно проигрывать дальше
+        # Сигнал плееру, что появился новый трек / текущий доиграл
         self.next_event = asyncio.Event()
 
         # Защита от запуска нескольких плееров на один guild
         self.player_task: asyncio.Task | None = None
 
         # Режим повтора и флаг ручного пропуска. skipped=True означает, что трек
-        # завершился НЕ сам, а через /skip — тогда repeat-one его не возвращает.
+        # завершился НЕ сам (/skip, ⏮️, «Стоп») — тогда повтор его не возвращает.
         self.repeat: RepeatMode = RepeatMode.OFF
         self.skipped: bool = False
 
-        # Громкость 0.0..2.0 (на будущее; FFmpegOpusAudio без PCMVolume)
-        self.volume: float = 1.0
+        # Счётчик «Стопов»/пропусков. Плеер запоминает его перед подготовкой
+        # трека (поиск, скачивание — это секунды) и, если за это время нажали
+        # «Стоп» или «Пропустить», выбрасывает подготовленное вместо игры.
+        self.generation: int = 0
 
         # Живая панель-плеер: сообщение с эмбедом и кнопками + где оно висит.
-        # panel_message переиспользуется/редактируется при смене состояния.
         self.panel_message = None      # discord.Message | None
         self.text_channel = None       # discord.abc.Messageable | None
 
@@ -77,18 +78,20 @@ class GuildMusicState:
     def clear(self) -> None:
         self._queue.clear()
 
+    def skip_current(self) -> None:
+        """Текущий трек — не доигрывать и не повторять (играет он или ещё готовится)."""
+        self.skipped = True
+        self.generation += 1
+
+    def stop(self) -> None:
+        """«Стоп»: очистить очередь и бросить текущий трек."""
+        self.clear()
+        self.skip_current()
+
     def cycle_repeat(self) -> RepeatMode:
         """Переключить режим повтора OFF→ONE→ALL→OFF. Вернуть новый режим."""
         self.repeat = RepeatMode((self.repeat + 1) % 3)
         return self.repeat
-
-    def remove(self, index: int) -> Track | None:
-        """Удалить трек по индексу (0-based). None если индекс невалиден."""
-        if 0 <= index < len(self._queue):
-            track = self._queue[index]
-            del self._queue[index]
-            return track
-        return None
 
     @property
     def upcoming(self) -> list[Track]:

@@ -1,442 +1,423 @@
-"""MusicPlayer: извлечение аудиопотока через yt-dlp и цикл воспроизведения."""
+"""MusicPlayer: подготовка трека (поиск, скачивание) и цикл воспроизведения.
+
+Как играет трек:
+  1. Подготовка (_prepare): если трек из Spotify/Last.fm — находим его на YT Music;
+     дальше либо берём прямую ссылку на поток, либо (FORCE_PIPE / датацентровый
+     IP) скачиваем звук целиком во временный файл через yt-dlp.
+  2. Пока играет трек, следующий в очереди готовится заранее (prefetch) —
+     между треками нет паузы на скачивание.
+  3. Звук отдаётся в Discord через FFmpeg; Opus копируется без перекодирования.
+"""
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import aiohttp
 import discord
-import yt_dlp
 
 import config
+from . import sources, ytdl
 from .queue import GuildMusicState, RepeatMode
-from .track import SearchResult, Track
+from .track import Track
 
 logger = logging.getLogger("music_bot.player")
 
-# Выделенный пул потоков под блокирующие вызовы yt-dlp (resolve/search). Свой пул,
-# чтобы тяжёлые extract_info не конкурировали с дефолтным executor event-loop'а и
-# нагрузка была предсказуемой. 4 воркера с запасом покрывают несколько серверов.
-_YTDL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdl")
-
-# ── Настройки yt-dlp ──────────────────────────────────────────────────────────
-# Получаем ТОЛЬКО метаданные + прямой URL потока, без скачивания на диск.
-YTDL_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "nocheckcertificate": True,
-    "ignoreerrors": False,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",   # текстовый запрос → поиск на YouTube
-    "source_address": "0.0.0.0",    # обход некоторых проблем с IPv6
-    "skip_download": True,
-    "cachedir": False,              # не плодить кэш на диске
-    # ВНИМАНИЕ: не форсируем player_client. Принудительный android-клиент YouTube
-    # отдаёт throttled-потоки → музыка лагает/заикается. Пусть yt-dlp сам выбирает
-    # лучший рабочий клиент — так поток стабильнее.
-    # YouTube теперь требует JS-рантайм для решения sig/n-challenge; без него
-    # yt-dlp отдаёт тротлённые или «мёртвые» ссылки — трек обрывается через
-    # пару секунд, бот молчит. Разрешаем deno (дефолт) и node (стоит у нас);
-    # солвер ставится пакетом yt-dlp-ejs (см. requirements.txt).
-    "js_runtimes": {"deno": {}, "node": {}},
-}
-
-# ── Настройки FFmpeg ──────────────────────────────────────────────────────────
 # reconnect-флаги критичны: прямые ссылки на поток нестабильны и рвутся.
-# rw_timeout (микросекунды) — не висеть вечно на «мёртвом» соединении:
-# на хостингах googlevideo часто не отвечает датацентровым IP, и без таймаута
-# ffmpeg молча ждёт, а бот «играет тишину».
+# rw_timeout (мкс) — не висеть вечно на «мёртвом» соединении.
 FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 "
     "-reconnect_delay_max 5 -rw_timeout 15000000"
 )
 FFMPEG_OPTS = "-vn"
 
-# Один общий экземпляр YoutubeDL (потокобезопасен для extract_info)
-_ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
-
-# Отдельный «лёгкий» экземпляр для поиска вариантов: extract_flat не лезет в
-# каждое видео за потоком (это было бы медленно), отдаёт только метаданные списка.
-YTDL_SEARCH_OPTS = {
-    **YTDL_OPTS,
-    "extract_flat": True,
-    "noplaylist": False,
-}
-_ytdl_search = yt_dlp.YoutubeDL(YTDL_SEARCH_OPTS)
-
-# Глобальный (на процесс) флаг «прямые ссылки googlevideo не работают».
-# Раньше жил в экземпляре MusicPlayer и сбрасывался при каждом переподключении
-# к войсу — бот заново наступал на те же грабли (30+ секунд таймаутов ffprobe/
-# ffmpeg на каждый первый трек). Сеть хостинга за время жизни процесса не
-# меняется, так что запоминаем один раз. FORCE_PIPE=1 в .env выставляет его
-# сразу — на датацентровых IP не тратим ни одной попытки на прямые ссылки.
+# «Прямые ссылки googlevideo не работают» — запоминаем на весь процесс (сеть
+# не меняется). FORCE_PIPE=1 выставляет сразу: на датацентровых IP и через
+# туннели сразу качаем через yt-dlp, не тратя время на мёртвые ссылки.
 _PREFER_PIPE = config.FORCE_PIPE
+
+# Треки длиннее часа не качаем на диск, а играем живым потоком.
+MAX_CACHE_DURATION = 60 * 60
+TMP_PREFIX = "musicbot-"
+# Сколько ждать, пока discord.py сам переподключит голос после обрыва.
+RECONNECT_WAIT = 30
+
+
+def prefer_pipe() -> bool:
+    return _PREFER_PIPE
+
+
+def cleanup_stale_files() -> int:
+    """Удалить временные файлы, оставшиеся после падения прошлого запуска."""
+    removed = 0
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), TMP_PREFIX + "*.audio")):
+        if ytdl.remove_file(path):
+            removed += 1
+    return removed
+
+
+@dataclass(slots=True)
+class Prepared:
+    """Готовый к игре трек: прямой поток, файл на диске или живой yt-dlp pipe."""
+
+    kind: str                  # "direct" | "file" | "pipe"
+    url: str | None = None     # direct: ссылка на поток; pipe: страница трека
+    path: str | None = None    # file: путь к скачанному звуку
+
+    def discard(self) -> None:
+        ytdl.discard_file(self.path)
+
+
+async def _stream_reachable(url: str) -> bool:
+    """Быстро (≤4с) проверить, открывается ли прямая ссылка на поток.
+
+    На мёртвой ссылке ffprobe висит до 20с, а потом бот молчит — дешевле
+    заранее спросить 1 КБ по HTTP.
+    """
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as s:
+            async with s.get(url, headers={"Range": "bytes=0-1023"}) as resp:
+                return resp.status in (200, 206)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class MusicPlayer:
-    """Управляет воспроизведением для одного сервера.
-
-    Запускает фоновую корутину _player_loop, которая последовательно берёт
-    треки из GuildMusicState и проигрывает их через FFmpegOpusAudio.
-    """
+    """Воспроизведение для одного сервера: фоновая корутина player_loop."""
 
     def __init__(
         self,
-        voice_client: discord.VoiceClient,
+        guild: discord.Guild,
         state: GuildMusicState,
         idle_timeout: int,
         on_disconnect,
         on_track_change=None,
+        on_track_error=None,
     ):
-        self.voice_client = voice_client
+        self.guild = guild
         self.state = state
         self.idle_timeout = idle_timeout
-        self._on_disconnect = on_disconnect  # async callback(guild_id) при простое
-        # async callback(guild_id): дёргаем при смене того, что играет, — чтобы
-        # cog обновил живую панель-плеер.
-        self._on_track_change = on_track_change
+        self._on_disconnect = on_disconnect      # async (guild_id) — простой/потеря голоса
+        self._on_track_change = on_track_change  # async (guild_id) — обновить панель
+        self._on_track_error = on_track_error    # async (guild_id, track) — трек не сыграл
         self._loop = asyncio.get_running_loop()
+        # Заранее готовящиеся треки: id(track) → (track, задача/future с Prepared).
+        # Сам трек храним, чтобы не спутать с новым объектом, получившим тот же id.
+        self._prefetch: dict[int, tuple[Track, asyncio.Future]] = {}
+        # Что играет прямо сейчас — чтобы прибрать за собой при отмене плеера.
+        self._playing: tuple[Prepared, subprocess.Popen | None] | None = None
+        # Подготовка текущего трека (поиск/скачивание) — её обрывает «Пропустить».
+        self._prep_task: asyncio.Task | None = None
 
-    @staticmethod
-    async def _stream_reachable(url: str) -> bool:
-        """Быстрая проверка (≤4с), открывается ли прямая ссылка googlevideo.
+    @property
+    def voice_client(self) -> discord.VoiceClient | None:
+        """Всегда актуальный голос сервера (после /leave + /join объект новый)."""
+        return self.guild.voice_client  # type: ignore[return-value]
 
-        Обязательна перед from_probe: на мёртвой ссылке ffprobe висит до 20с,
-        а fallback-проба discord.py «успешно» возвращает дефолтный кодек —
-        источник создаётся, ffmpeg умирает, и бот молчит. Дешевле спросить
-        1 КБ по HTTP заранее, чем терять полминуты на таймауты.
-        """
-        try:
-            timeout = aiohttp.ClientTimeout(total=4)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    url, headers={"Range": "bytes=0-1023"}
-                ) as resp:
-                    return resp.status in (200, 206)
-        except Exception:  # noqa: BLE001
-            return False
-
-    async def _notify_change(self) -> None:
-        if self._on_track_change is not None:
+    async def _notify(self, callback, *args) -> None:
+        if callback is not None:
             try:
-                await self._on_track_change(self.state.guild_id)
+                await callback(self.state.guild_id, *args)
             except Exception as e:  # noqa: BLE001
-                logger.warning("[player] on_track_change failed: %s", e)
+                logger.warning("[player] callback %s failed: %s", callback.__name__, e)
 
-    # ── Извлечение трека через yt-dlp (в отдельном потоке) ────────────────
+    # ── Подготовка трека ──────────────────────────────────────────────────
     @staticmethod
-    async def resolve(query: str, requester: str) -> Track | None:
-        """Получить Track по ссылке или поисковому запросу. None при ошибке."""
-        loop = asyncio.get_running_loop()
-        try:
-            # extract_info блокирующий → выносим в выделенный пул, чтобы не вешать loop
-            data = await loop.run_in_executor(
-                _YTDL_EXECUTOR, lambda: _ytdl.extract_info(query, download=False)
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[resolve] yt-dlp error for %r: %s", query, e)
-            return None
-
-        if data is None:
-            return None
-
-        # Поиск/плейлист возвращает 'entries' — берём первый результат
-        if "entries" in data:
-            entries = [e for e in data["entries"] if e]
-            if not entries:
-                return None
-            data = entries[0]
-
-        stream_url = data.get("url")
-        if not stream_url:
-            logger.warning("[resolve] no stream url for %r", query)
-            return None
-
-        return Track(
-            title=data.get("title", "Unknown"),
-            stream_url=stream_url,
-            webpage_url=data.get("webpage_url", query),
-            duration=data.get("duration"),
-            uploader=data.get("uploader"),
-            thumbnail=data.get("thumbnail"),
-            requested_by=requester,
-        )
+    async def _fill_from_match(track: Track) -> bool:
+        """Трек из Spotify/Last.fm → найти играбельную версию на YT Music."""
+        if track.webpage_url:
+            return True
+        artist, title = track.match or ("", track.title)
+        found = await sources.find_on_ytmusic(artist, title, track.duration)
+        if found is None:
+            logger.warning("[prepare] не нашёл на YouTube Music: %s — %s", artist, title)
+            return False
+        track.webpage_url = found.url
+        track.duration = track.duration or found.duration
+        track.thumbnail = track.thumbnail or found.thumbnail
+        return True
 
     @staticmethod
-    async def search(query: str, limit: int = 5) -> list[SearchResult]:
-        """Найти несколько вариантов по тексту (longmix, sped up, slowed, remix…).
+    def _tmp_path() -> str:
+        return os.path.join(tempfile.gettempdir(), f"{TMP_PREFIX}{uuid.uuid4().hex}.audio")
 
-        Возвращает до `limit` результатов без скачивания потоков (быстро).
-        Поток получаем позже, только для выбранного варианта (resolve).
-        """
-        loop = asyncio.get_running_loop()
-        try:
-            data = await loop.run_in_executor(
-                _YTDL_EXECUTOR,
-                lambda: _ytdl_search.extract_info(f"ytsearch{limit}:{query}", download=False),
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[search] yt-dlp error for %r: %s", query, e)
-            return []
+    @staticmethod
+    def _download_timeout(track: Track) -> float:
+        # Не меньше 3 минут, а для длинных треков — не меньше их длительности.
+        return max(180.0, float(track.duration or 0))
 
-        entries = (data or {}).get("entries") or []
-        out: list[SearchResult] = []
-        for e in entries:
-            if not e:
-                continue
-            url = e.get("url") or e.get("webpage_url")
-            if not url:
-                continue
-            out.append(SearchResult(
-                title=e.get("title", "Unknown"),
-                url=url,
-                duration=e.get("duration"),
-                uploader=e.get("uploader") or e.get("channel"),
-            ))
-        return out
-
-    # ── Создание аудио-источника ──────────────────────────────────────────
-    # Треки длиннее этого лимита не кэшируем на диск (стримим через pipe),
-    # чтобы не забивать диск часовыми сетами. None-длительность = прямой эфир.
-    _MAX_CACHE_DURATION = 60 * 60  # 1 час
-
-    def _ytdlp_cmd(self, track: Track) -> list[str]:
-        """Общая команда yt-dlp: аудио в stdout."""
-        return [
-            sys.executable, "-m", "yt_dlp",
-            "-f", "bestaudio/best",
-            "--no-playlist",
-            "--force-ipv4",
-            "--js-runtimes", "deno",
-            "--js-runtimes", "node",
-            "--quiet", "--no-warnings",
-            "-o", "-",
-            track.webpage_url,
-        ]
-
-    def _spawn_pipe(self, track: Track) -> subprocess.Popen:
-        """Запустить yt-dlp, который льёт аудио в stdout (для pipe-режима).
-
-        Качает через сам yt-dlp: чанками, с обходом троттлинга и --force-ipv4 —
-        работает там, где прямая ссылка для ffmpeg недоступна (датацентровые IP).
-        """
-        return subprocess.Popen(
-            self._ytdlp_cmd(track), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-
-    def _download_blocking(self, track: Track) -> str | None:
-        """Скачать аудио целиком во временный файл. Вернуть путь или None.
-
-        Вызывается в executor (блокирующий subprocess). Играть с диска, а не
-        из живого пайпа, критично против «ускорений»: плеер шлёт фреймы каждые
-        20 мс, и любая сетевая задержка чтения копится, а потом фреймы уходят
-        пачкой без пауз — слушается как перемотка. Диск задержек не даёт.
-        """
-        path = os.path.join(
-            tempfile.gettempdir(), f"musicbot-{uuid.uuid4().hex}.audio"
-        )
-        try:
-            with open(path, "wb") as f:
-                proc = subprocess.run(
-                    self._ytdlp_cmd(track), stdout=f,
-                    stderr=subprocess.DEVNULL, timeout=300,
-                )
-            if proc.returncode == 0 and os.path.getsize(path) > 0:
-                return path
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[download] %r: %s", track.title, e)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    @staticmethod
+    async def _download_with_fallback(track: Track) -> Prepared | None:
+        path = MusicPlayer._tmp_path()
+        timeout = MusicPlayer._download_timeout(track)
+        if await ytdl.download(track.webpage_url, path, timeout):
+            return Prepared("file", path=path)
+        # YouTube отказал (403, «Sign in to confirm…») — ищем ту же песню на SoundCloud.
+        if "youtu" in (track.webpage_url or ""):
+            if track.match:
+                query = f"{track.match[0]} {track.match[1]}"
+            elif track.source == "YouTube":
+                query = track.title
+            else:
+                query = f"{track.uploader or ''} {track.title}"
+            alt = await sources.soundcloud_alternative(query.strip())
+            if alt:
+                logger.info("[prepare] YouTube не отдал %r — играю с SoundCloud", track.title)
+                path = MusicPlayer._tmp_path()
+                if await ytdl.download(alt, path, timeout):
+                    return Prepared("file", path=path)
         return None
 
     @staticmethod
-    def _remove_file(path: str | None) -> None:
-        if path:
+    async def _prepare(track: Track) -> Prepared | None:
+        """Довести трек до состояния «можно играть». None — не получилось."""
+        global _PREFER_PIPE
+        if not await MusicPlayer._fill_from_match(track):
+            return None
+        if not _PREFER_PIPE:
             try:
-                os.remove(path)
-            except OSError:
-                pass
+                info = ytdl.first_entry(await ytdl.extract(track.webpage_url))
+            except ytdl.YtdlError as e:
+                logger.warning("[prepare] yt-dlp: %s", e)
+                info = None
+            if info and info.get("url"):
+                track.duration = track.duration or info.get("duration")
+                track.live = track.live or bool(info.get("is_live"))
+                if await _stream_reachable(info["url"]):
+                    return Prepared("direct", url=info["url"])
+                logger.warning("[prepare] прямая ссылка недоступна (датацентровый IP/туннель?) "
+                               "— дальше качаю через yt-dlp")
+                _PREFER_PIPE = True
+        if track.live or (track.duration and track.duration > MAX_CACHE_DURATION):
+            return Prepared("pipe", url=track.webpage_url)   # эфир или очень длинный трек
+        return await MusicPlayer._download_with_fallback(track)
+
+    # ── Предзагрузка следующего трека ─────────────────────────────────────
+    def _drop_prefetch(self, key: int) -> None:
+        entry = self._prefetch.pop(key, None)
+        if entry is None:
+            return
+        fut = entry[1]
+        if not fut.done():
+            fut.cancel()            # ytdl.download сам удалит недокачанный файл
+        elif not fut.cancelled() and fut.exception() is None and fut.result():
+            fut.result().discard()
+
+    def drop_all_prefetch(self) -> None:
+        for key in list(self._prefetch):
+            self._drop_prefetch(key)
+
+    def schedule_prefetch(self) -> None:
+        """Начать готовить следующий трек очереди (пока играет текущий)."""
+        upcoming = self.state.upcoming
+        nxt = upcoming[0] if upcoming else None
+        for key, (track, _) in list(self._prefetch.items()):
+            if track is not nxt:
+                self._drop_prefetch(key)
+        if nxt is not None and id(nxt) not in self._prefetch:
+            self._prefetch[id(nxt)] = (nxt, asyncio.ensure_future(self._prepare(nxt)))
+
+    async def _take_prepared(self, track: Track) -> Prepared | None:
+        entry = self._prefetch.pop(id(track), None)
+        if entry is not None and entry[0] is track:
+            try:
+                prepared = await entry[1]
+                if prepared is not None:
+                    return prepared
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[prefetch] %r: %s", track.title, e)
+        elif entry is not None:
+            self._prefetch[id(track)] = entry
+            self._drop_prefetch(id(track))
+        return await self._prepare(track)
+
+    # ── Источник звука ────────────────────────────────────────────────────
+    @staticmethod
+    async def _make_source(prepared: Prepared):
+        """→ (AudioSource, процесс yt-dlp для pipe или None)."""
+        if prepared.kind == "direct":
+            src = await discord.FFmpegOpusAudio.from_probe(
+                prepared.url, before_options=FFMPEG_BEFORE_OPTS, options=FFMPEG_OPTS)
+            return src, None
+        if prepared.kind == "file":
+            # from_probe видит opus → FFmpeg копирует звук без перекодирования.
+            return await discord.FFmpegOpusAudio.from_probe(prepared.path, options=FFMPEG_OPTS), None
+        proc = ytdl.spawn_pipe(prepared.url)
+        return discord.FFmpegOpusAudio(proc.stdout, pipe=True, options=FFMPEG_OPTS), proc
 
     @staticmethod
-    def _kill_pipe(proc: subprocess.Popen | None) -> None:
+    def _kill(proc: subprocess.Popen | None) -> None:
         if proc is not None and proc.poll() is None:
             try:
                 proc.kill()
             except OSError:
                 pass
 
-    async def _make_source(
-        self, track: Track
-    ) -> tuple[discord.AudioSource | None, bool, subprocess.Popen | None, str | None]:
-        """Создать источник звука. Возвращает (source, used_pipe, ytdlp_proc, tmp_path).
+    async def _wait_voice(self) -> bool:
+        """Голос отвалился (туннель моргнул) — даём discord.py переподключиться."""
+        for _ in range(RECONNECT_WAIT):
+            vc = self.voice_client
+            if vc is not None and vc.is_connected():
+                return True
+            await asyncio.sleep(1)
+        vc = self.voice_client
+        return vc is not None and vc.is_connected()
 
-        Сначала пробуем прямой поток (дёшево: без перекодирования, если opus).
-        Если он не открывается — переходим на yt-dlp и запоминаем это в
-        _PREFER_PIPE (глобально на процесс), чтобы не тратить время на мёртвый
-        вариант при каждом треке/переподключении.
+    def interrupt_preparing(self) -> None:
+        """«Пропустить»/«Стоп», пока трек ещё качается, — не ждать конца скачивания."""
+        if self._prep_task is not None and not self._prep_task.done():
+            self._prep_task.cancel()
 
-        В yt-dlp-режиме обычный трек сначала качается целиком во временный файл
-        и играется с диска — иначе сетевой джиттер пайпа слышен как «ускорения».
-        Живой пайп остаётся только для стримов и очень длинных треков.
-        """
-        global _PREFER_PIPE
-        if not _PREFER_PIPE:
-            if not await self._stream_reachable(track.stream_url):
-                logger.warning(
-                    "[player_loop] прямая ссылка googlevideo недоступна "
-                    "(датацентровый IP?) — переключаюсь на yt-dlp pipe"
-                )
-                _PREFER_PIPE = True
-        if not _PREFER_PIPE:
-            try:
-                # from_probe (ffprobe) точно определяет кодек: если это opus,
-                # FFmpeg копирует поток без перекодирования (дёшево).
-                source = await discord.FFmpegOpusAudio.from_probe(
-                    track.stream_url,
-                    before_options=FFMPEG_BEFORE_OPTS,
-                    options=FFMPEG_OPTS,
-                )
-                return source, False, None, None
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "[player_loop] прямой поток не открылся (%s) — "
-                    "переключаюсь на yt-dlp pipe", e,
-                )
-                _PREFER_PIPE = True
+    def _release_playing(self) -> None:
+        """Прибрать за играющим треком: оборвать звук, убить yt-dlp, удалить файл."""
+        if self._playing is None:
+            return
+        prepared, proc = self._playing
+        self._playing = None
+        vc = self.voice_client
+        if vc is not None and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        self._kill(proc)
+        prepared.discard()
 
-        # Обычный трек известной длины → скачать целиком и играть с диска.
-        if track.duration and track.duration <= self._MAX_CACHE_DURATION:
-            path = await self._loop.run_in_executor(
-                _YTDL_EXECUTOR, self._download_blocking, track
-            )
-            if path is not None:
-                try:
-                    source = await discord.FFmpegOpusAudio.from_probe(
-                        path, options=FFMPEG_OPTS
-                    )
-                    return source, True, None, path
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "[player_loop] файл не открылся (%s) — живой pipe", e
-                    )
-                    self._remove_file(path)
-            else:
-                logger.warning(
-                    "[player_loop] скачивание не удалось — живой pipe"
-                )
-
-        try:
-            proc = self._spawn_pipe(track)
-            # Без from_probe: пайп нельзя «прощупать» дважды. FFmpeg сам
-            # перекодирует в opus — чуть дороже по CPU, зато надёжно.
-            source = discord.FFmpegOpusAudio(
-                proc.stdout, pipe=True, options=FFMPEG_OPTS
-            )
-            return source, True, proc, None
-        except Exception as e:  # noqa: BLE001
-            logger.error("[player_loop] pipe source error: %s", e)
-            return None, True, None, None
-
-    # ── Основной цикл воспроизведения ─────────────────────────────────────
+    # ── Основной цикл ─────────────────────────────────────────────────────
     async def player_loop(self) -> None:
-        """Берёт треки из очереди и проигрывает их по очереди.
+        """Берёт треки из очереди и играет по одному. Сам выходит при простое."""
+        try:
+            await self._run()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("[player] плеер упал на сервере %s", self.state.guild_id)
+            self.state.current = None
+            await self._notify(self._on_track_change)
+        finally:
+            self.interrupt_preparing()
+            self._release_playing()
+            self.drop_all_prefetch()
 
-        Завершается сам при простое дольше idle_timeout — тогда вызывает
-        on_disconnect для отключения от голосового канала.
-        """
+    async def _run(self) -> None:
+        global _PREFER_PIPE
         while True:
             self.state.next_event.clear()
-
             track = self.state.get_nowait()
             if track is None:
-                # Очередь пуста — ждём новый трек или таймаут простоя
                 try:
-                    await asyncio.wait_for(
-                        self.state.next_event.wait(), timeout=self.idle_timeout
-                    )
+                    await asyncio.wait_for(self.state.next_event.wait(), timeout=self.idle_timeout)
                 except asyncio.TimeoutError:
-                    logger.info(
-                        "[player_loop] idle timeout on guild %s — disconnecting",
-                        self.state.guild_id,
-                    )
+                    logger.info("[player] простой на сервере %s — отключаюсь", self.state.guild_id)
                     await self._on_disconnect(self.state.guild_id)
                     return
                 continue
 
+            generation = self.state.generation
             self.state.current = track
-
-            source, used_pipe, pipe_proc, tmp_path = await self._make_source(track)
-            if source is None:
-                logger.error("[player_loop] FFmpeg source error, skip %r", track.title)
+            self._prep_task = asyncio.ensure_future(self._take_prepared(track))
+            try:
+                prepared = await self._prep_task
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+                prepared = None             # оборвали «Пропустить»/«Стоп»
+            finally:
+                self._prep_task = None
+            if self.state.generation != generation:     # пока готовили — «Стоп»/«Пропустить»
+                if prepared:
+                    prepared.discard()
                 self.state.current = None
+                self.schedule_prefetch()
+                continue
+            if prepared is None:
+                logger.error("[player] не удалось подготовить %r — пропускаю", track.title)
+                self.state.current = None
+                await self._notify(self._on_track_error, track)
                 continue
 
-            # Колбэк after вызывается из другого потока → пробрасываем в loop
-            def _after(error: Exception | None) -> None:
-                if error:
-                    logger.error("[player_loop] playback error: %s", error)
-                self._loop.call_soon_threadsafe(self.state.next_event.set)
+            try:
+                source, pipe_proc = await self._make_source(prepared)
+            except Exception as e:  # noqa: BLE001
+                logger.error("[player] FFmpeg не открыл %r: %s", track.title, e)
+                prepared.discard()
+                self.state.current = None
+                await self._notify(self._on_track_error, track)
+                continue
 
-            if not self.voice_client.is_connected():
-                self._kill_pipe(pipe_proc)
-                self._remove_file(tmp_path)
-                logger.info("[player_loop] voice disconnected, stopping loop")
+            if not await self._wait_voice():
+                logger.info("[player] голос потерян — останавливаю плеер")
+                source.cleanup()
+                self._kill(pipe_proc)
+                prepared.discard()
+                self.state.current = None
+                await self._on_disconnect(self.state.guild_id)
                 return
 
+            def _after(error: Exception | None) -> None:
+                if error:
+                    logger.error("[player] ошибка воспроизведения: %s", error)
+                self._loop.call_soon_threadsafe(self.state.next_event.set)
+
+            # Пропуск/«Стоп», нажатые до этого момента, уже отработали через
+            # generation выше; дальше считаем только то, что нажмут во время игры.
+            self.state.skipped = False
+            self.state.next_event.clear()
+            try:
+                self.voice_client.play(source, after=_after)
+            except Exception as e:  # noqa: BLE001
+                logger.error("[player] не смог запустить %r: %s", track.title, e)
+                source.cleanup()
+                self._kill(pipe_proc)
+                prepared.discard()
+                self.state.current = None
+                await self._notify(self._on_track_error, track)
+                continue
+            self._playing = (prepared, pipe_proc)
             started_at = self._loop.time()
-            self.voice_client.play(source, after=_after)
-            logger.info(
-                "[player_loop] now playing %r on guild %s%s",
-                track.title, self.state.guild_id,
-                " (yt-dlp pipe)" if used_pipe else "",
-            )
-            await self._notify_change()  # обновить панель: заиграл новый трек
+            logger.info("[player] играет %r (%s) на сервере %s",
+                        track.title, prepared.kind, self.state.guild_id)
+            await self._notify(self._on_track_change)
+            self.schedule_prefetch()
 
-            # Ждём окончания трека (event выставит _after)
             await self.state.next_event.wait()
-            self._kill_pipe(pipe_proc)
-            self._remove_file(tmp_path)
-
+            self._playing = None
+            self._kill(pipe_proc)
             played = self._loop.time() - started_at
-            # «Молчащий бот»: прямой поток открылся, но умер почти сразу
-            # (датацентровый IP, Connection timed out). Не считаем трек
-            # отыгранным — пробуем его же ещё раз, уже через yt-dlp pipe.
-            # Порог 12с: ffmpeg с rw_timeout=15s умирает на мёртвой ссылке
-            # за ~5с — старый порог <5 такие случаи пропускал впритык.
-            if (
-                not used_pipe
-                and not self.state.skipped
-                and played < 12
-                and (track.duration or 999) > 30
-            ):
-                logger.warning(
-                    "[player_loop] трек оборвался за %.1fс — повтор через pipe",
-                    played,
-                )
-                global _PREFER_PIPE
+
+            # Прямой поток открылся, но умер почти сразу (IP режут) — не считаем
+            # трек отыгранным, повторяем его же через скачивание.
+            if (prepared.kind == "direct" and not self.state.skipped
+                    and played < 12 and (track.duration or 999) > 30):
+                logger.warning("[player] трек оборвался за %.1fс — повтор через yt-dlp", played)
                 _PREFER_PIPE = True
                 self.state.add_front(track)
                 self.state.current = None
                 continue
 
-            # Повтор: трек завершился — решаем его судьбу по режиму повтора.
-            # skipped=True (через /skip или кнопку) перебивает repeat-one и
-            # repeat-all для ЭТОГО трека: пропуск всегда идёт к следующему.
+            # Повтор: /skip, ⏮️ и «Стоп» ставят skipped — тогда трек не возвращаем
+            # (⏮️ сам кладёт трек обратно в начало очереди).
             if not self.state.skipped:
                 if self.state.repeat is RepeatMode.ONE:
-                    self.state.add_front(track)   # тот же трек снова
+                    self.state.add_front(track)
                 elif self.state.repeat is RepeatMode.ALL:
-                    self.state.add(track)          # в конец — крутим всю очередь
+                    self.state.add(track)
             self.state.skipped = False
 
+            upcoming = self.state.upcoming
+            if prepared.kind == "file" and upcoming and upcoming[0] is track:
+                # Тот же трек сыграет снова (повтор, ⏮️) — не качаем его заново.
+                done = self._loop.create_future()
+                done.set_result(prepared)
+                self._prefetch[id(track)] = (track, done)
+            else:
+                prepared.discard()
+
             self.state.current = None
-            await self._notify_change()  # обновить панель: трек закончился
+            await self._notify(self._on_track_change)

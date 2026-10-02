@@ -7,4 +7,10 @@ yt-dlp>=2026.7.4
 # трек обрывается через пару секунд. Нужен JS-рантайм (node или deno) в системе.
 yt-dlp-ejs>=0.8.0
 python-dotenv>=1.0.1
+# Поиск по YouTube Music и подбор играбельной версии для треков из Spotify/Last.fm.
+ytmusicapi>=1.8.0
+aiohttp>=3.9
 PyNaCl>=1.5.0
+# Для хостингов-панелей без apt (только Linux; дома используются свои ffmpeg/node):
+# deno — JS-рантайм для yt-dlp-ejs. Если на хостинге нет ffmpeg — добавь static-ffmpeg.
+deno>=2.0; sys_platform == "linux"
