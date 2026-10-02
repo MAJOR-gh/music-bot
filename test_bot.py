@@ -399,6 +399,47 @@ def test_match_score_prefers_right_song():
         sources.match_score(bad, "Queen", "Bohemian Rhapsody", 354)
 
 
+def test_split_artist_title():
+    assert sources.split_artist_title("Mick Gordon - Doom 2016: Menu theme (HQ, file rip)") == (
+        "Mick Gordon", "Doom 2016: Menu theme")
+    assert sources.split_artist_title("Song Name [Official Video]", "Band - Topic") == (
+        "Band", "Song Name")
+
+
+def test_bot_check_detected():
+    ytdl.last_bot_check = None
+    ytdl.note_error("ERROR: [youtube] x: Sign in to confirm you’re not a bot. Use --cookies")
+    assert ytdl.last_bot_check is not None
+    ytdl.last_bot_check = None
+    ytdl.note_error("ERROR: HTTP Error 404")
+    assert ytdl.last_bot_check is None
+
+
+def test_soundcloud_picks_matching_track():
+    async def fake_extract(target, *, flat=False, timeout=60):
+        return {"entries": [
+            {"url": "sc/wrong", "title": "Doom Eternal OST - BFG Division", "duration": 500,
+             "uploader": "someone"},
+            {"url": "sc/right", "title": "Doom 2016 - Menu Theme", "duration": 241,
+             "uploader": "Mick Gordon"},
+        ]}
+
+    async def fake_extract_junk(target, *, flat=False, timeout=60):
+        return {"entries": [{"url": "sc/junk", "title": "Totally different", "duration": 30,
+                             "uploader": "x"}]}
+
+    real = ytdl.extract
+    try:
+        ytdl.extract = fake_extract
+        url = asyncio.run(sources.soundcloud_alternative("Mick Gordon", "Doom 2016: Menu theme", 240))
+        assert url == "sc/right", url
+        ytdl.extract = fake_extract_junk
+        url = asyncio.run(sources.soundcloud_alternative("Mick Gordon", "Doom 2016: Menu theme", 240))
+        assert url is None, url        # лучше не сыграть, чем включить другую песню
+    finally:
+        ytdl.extract = real
+
+
 ASYNC_TESTS = [
     test_plays_queue_in_order,
     test_second_enqueue_does_not_cut_current,
@@ -417,6 +458,7 @@ ASYNC_TESTS = [
     test_leave_cancels_player_and_cleans_up,
 ]
 SYNC_TESTS = [test_helpers, test_spotify_parsing, test_match_score_prefers_right_song,
+              test_split_artist_title, test_bot_check_detected, test_soundcloud_picks_matching_track,
               test_discard_file_waits_until_unlocked]
 
 

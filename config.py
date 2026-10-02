@@ -63,6 +63,9 @@ if FFMPEG_DIR and os.path.isdir(FFMPEG_DIR):
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 _cookies = os.getenv("YTDLP_COOKIES", "").strip() or os.path.join(_BOT_DIR, "cookies.txt")
 YTDLP_COOKIES: str | None = _cookies if os.path.isfile(_cookies) else None
+# Или брать куки прямо из браузера на этом ПК (firefox, chrome, edge…) — только
+# если файла cookies.txt нет. На хостинге браузера нет — там нужен cookies.txt.
+YTDLP_COOKIES_FROM_BROWSER: str = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
 
 # Хостинги-панели (Pterodactyl) ставят пакеты через `pip --prefix .local`:
 # бинарники из pip (deno — JS-рантайм для yt-dlp) лежат в .local/bin,

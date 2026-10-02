@@ -161,12 +161,10 @@ class MusicPlayer:
         # YouTube отказал (403, «Sign in to confirm…») — ищем ту же песню на SoundCloud.
         if "youtu" in (track.webpage_url or ""):
             if track.match:
-                query = f"{track.match[0]} {track.match[1]}"
-            elif track.source == "YouTube":
-                query = track.title
+                artist, title = track.match
             else:
-                query = f"{track.uploader or ''} {track.title}"
-            alt = await sources.soundcloud_alternative(query.strip())
+                artist, title = sources.split_artist_title(track.title, track.uploader)
+            alt = await sources.soundcloud_alternative(artist, title, track.duration)
             if alt:
                 logger.info("[prepare] YouTube не отдал %r — играю с SoundCloud", track.title)
                 path = MusicPlayer._tmp_path()

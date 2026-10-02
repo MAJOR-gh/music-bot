@@ -443,8 +443,17 @@ class MusicCog(commands.Cog):
             return
         except Exception as e:  # noqa: BLE001
             logger.warning("[search] %s %r: %s", label, query, e)
-            await interaction.followup.send(f"❌ Поиск ({label}) не удался: {str(e)[:200]}")
-            return
+            results = None
+            if key == "youtube":
+                # YouTube отшил поиск (бот-проверка и т.п.) — тот же запрос в YT Music.
+                try:
+                    results = await sources.search("ytmusic", query, config.SEARCH_RESULTS)
+                    label = f"{sources.SOURCES['ytmusic']} (YouTube не ответил)"
+                except Exception as e2:  # noqa: BLE001
+                    logger.warning("[search] запасной YT Music %r: %s", query, e2)
+            if results is None:
+                await interaction.followup.send(f"❌ Поиск ({label}) не удался: {str(e)[:200]}")
+                return
         if not results:
             await interaction.followup.send(f"❌ Ничего не нашёл ({label}) по запросу: `{query}`")
             return
@@ -618,6 +627,13 @@ class MusicCog(commands.Cog):
             inline=True,
         )
         embed.add_field(name="yt-dlp", value=f"`{updater.installed_version() or '—'}`", inline=True)
+        embed.add_field(name="Куки YouTube", value=ytdl.cookies_mode() or "нет", inline=True)
+        if ytdl.last_bot_check is not None:
+            embed.add_field(
+                name="⚠️ Бот-проверка YouTube",
+                value=f"была <t:{int(ytdl.last_bot_check)}:R> — нужны свежие куки",
+                inline=True,
+            )
         embed.add_field(
             name="Голосовой канал",
             value=f"🔊 {vc.channel.name}" if vc and vc.is_connected() else "—",

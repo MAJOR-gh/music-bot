@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 
 import config
 
@@ -39,7 +40,47 @@ def base_args() -> list[str]:
     ]
     if config.YTDLP_COOKIES:
         args += ["--cookies", config.YTDLP_COOKIES]
+    elif config.YTDLP_COOKIES_FROM_BROWSER:
+        args += ["--cookies-from-browser", config.YTDLP_COOKIES_FROM_BROWSER]
     return args
+
+
+# ── «Sign in to confirm you're not a bot» ─────────────────────────────────────
+# YouTube не доверяет IP (датацентр, VPN-выход) и требует вход в аккаунт.
+# Лечится куками залогиненного аккаунта (cookies.txt). Запоминаем, когда это
+# было в последний раз, — показываем в /ping и подсказываем в логе.
+BOT_CHECK_MARKERS = ("confirm you're not a bot", "confirm you’re not a bot",
+                     "sign in to confirm")
+last_bot_check: float | None = None
+_last_hint = 0.0
+
+
+def cookies_mode() -> str:
+    if config.YTDLP_COOKIES:
+        return "cookies.txt"
+    if config.YTDLP_COOKIES_FROM_BROWSER:
+        return f"из браузера ({config.YTDLP_COOKIES_FROM_BROWSER})"
+    return ""
+
+
+def note_error(message: str) -> None:
+    """Если YouTube требует вход — запомнить и (не чаще раза в 10 минут) подсказать, что делать."""
+    global last_bot_check, _last_hint
+    low = message.lower()
+    if not any(m in low for m in BOT_CHECK_MARKERS):
+        return
+    last_bot_check = time.time()
+    if time.monotonic() - _last_hint < 600:
+        return
+    _last_hint = time.monotonic()
+    if cookies_mode():
+        logger.warning("[youtube] YouTube требует вход, хотя куки заданы (%s) — куки протухли "
+                       "или аккаунт разлогинило: экспортируй cookies.txt заново.", cookies_mode())
+    else:
+        logger.warning("[youtube] YouTube считает IP ботом («Sign in to confirm you're not a bot»). "
+                       "Лечится куками аккаунта YouTube: положи cookies.txt рядом с ботом "
+                       "(или YTDLP_COOKIES_FROM_BROWSER=firefox в .env при запуске на своём ПК). "
+                       "Пока что бот ищет такие треки на SoundCloud.")
 
 
 def _last_error_line(stderr: bytes) -> str:
@@ -67,7 +108,9 @@ async def _run(args: list[str], timeout: float) -> bytes:
         await _kill(proc)
         raise
     if proc.returncode != 0:
-        raise YtdlError(_last_error_line(err))
+        message = _last_error_line(err)
+        note_error(message)
+        raise YtdlError(message)
     return out
 
 
@@ -125,7 +168,9 @@ async def download(url: str, path: str, timeout: float = 300) -> bool:
                 raise
         ok = proc.returncode == 0 and os.path.getsize(path) > 0
         if not ok:
-            logger.warning("[download] %s: %s", url, _last_error_line(err))
+            message = _last_error_line(err)
+            note_error(message)
+            logger.warning("[download] %s: %s", url, message)
     except asyncio.TimeoutError:
         logger.warning("[download] %s: таймаут %.0fс", url, timeout)
     except OSError as e:

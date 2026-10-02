@@ -72,15 +72,45 @@ async def youtube_title(url: str) -> str | None:
     return None
 
 
-async def soundcloud_alternative(query: str) -> str | None:
-    """Ссылка на ту же песню на SoundCloud (запасной вариант, если YouTube отказал)."""
+def split_artist_title(title: str, uploader: str | None = None) -> tuple[str, str]:
+    """«Artist - Song (Official Video) [HQ]» → ('Artist', 'Song') для поиска в других местах."""
+    clean = " ".join(_BRACKETS_RE.sub(" ", title or "").split())
+    for sep in (" - ", " – ", " — ", " | "):
+        if sep in clean:
+            artist, song = clean.split(sep, 1)
+            return artist.strip(), song.strip()
+    artist = (uploader or "").removesuffix(" - Topic").strip()
+    return artist, clean
+
+
+async def soundcloud_alternative(artist: str, title: str,
+                                 duration: int | None = None) -> str | None:
+    """Ссылка на ту же песню на SoundCloud (запасной вариант, если YouTube отказал).
+
+    Берём лучшее совпадение по названию/исполнителю/длительности, а не первое
+    попавшееся: лучше честно не сыграть, чем включить другую песню.
+    """
+    query = f"{artist} {title}".strip()
     try:
-        data = await ytdl.extract(f"scsearch1:{query}", flat=True, timeout=30)
+        data = await ytdl.extract(f"scsearch5:{query}", flat=True, timeout=30)
     except Exception as e:  # noqa: BLE001
         logger.warning("[soundcloud] %r: %s", query, e)
         return None
-    entry = ytdl.first_entry(data)
-    return entry and (entry.get("url") or entry.get("webpage_url"))
+    found = []
+    for e in (data or {}).get("entries") or []:
+        url = e and (e.get("url") or e.get("webpage_url"))
+        if url:
+            found.append(SearchResult(
+                title=e.get("title") or "", url=url, duration=_int(e.get("duration")),
+                uploader=e.get("uploader"), source="SoundCloud",
+            ))
+    if not found:
+        return None
+    best = max(found, key=lambda r: match_score(r, artist, title, duration))
+    if match_score(best, artist, title, duration) < 2:
+        logger.info("[soundcloud] для %r нет похожего трека (лучший: %r)", query, best.title)
+        return None
+    return best.url
 
 
 # ── YouTube Music ─────────────────────────────────────────────────────────────
