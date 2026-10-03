@@ -36,6 +36,10 @@ FFMPEG_BEFORE_OPTS = (
     "-reconnect_delay_max 5 -rw_timeout 15000000"
 )
 FFMPEG_OPTS = "-vn"
+# Битрейт (кбит/с), когда звук приходится перекодировать в Opus (AAC/MP3 с
+# SoundCloud, часть форматов YouTube). from_probe из discord.py ставит здесь
+# НЕ МЕНЬШЕ 512 — выходят пакеты по ~1200 байт, Discord их режет, звук хрипит.
+ENCODE_BITRATE = 128
 
 # «Прямые ссылки googlevideo не работают» — запоминаем на весь процесс (сеть
 # не меняется). FORCE_PIPE=1 выставляет сразу: на датацентровых IP и через
@@ -240,17 +244,23 @@ class MusicPlayer:
 
     # ── Источник звука ────────────────────────────────────────────────────
     @staticmethod
+    async def _opus_source(source: str, **kwargs) -> discord.FFmpegOpusAudio:
+        """Opus копируем как есть, всё остальное кодируем в ENCODE_BITRATE."""
+        codec, _ = await discord.FFmpegOpusAudio.probe(source)
+        return discord.FFmpegOpusAudio(
+            source, codec=codec, bitrate=ENCODE_BITRATE, options=FFMPEG_OPTS, **kwargs)
+
+    @staticmethod
     async def _make_source(prepared: Prepared):
         """→ (AudioSource, процесс yt-dlp для pipe или None)."""
         if prepared.kind == "direct":
-            src = await discord.FFmpegOpusAudio.from_probe(
-                prepared.url, before_options=FFMPEG_BEFORE_OPTS, options=FFMPEG_OPTS)
+            src = await MusicPlayer._opus_source(prepared.url, before_options=FFMPEG_BEFORE_OPTS)
             return src, None
         if prepared.kind == "file":
-            # from_probe видит opus → FFmpeg копирует звук без перекодирования.
-            return await discord.FFmpegOpusAudio.from_probe(prepared.path, options=FFMPEG_OPTS), None
+            return await MusicPlayer._opus_source(prepared.path), None
         proc = ytdl.spawn_pipe(prepared.url)
-        return discord.FFmpegOpusAudio(proc.stdout, pipe=True, options=FFMPEG_OPTS), proc
+        return discord.FFmpegOpusAudio(
+            proc.stdout, pipe=True, bitrate=ENCODE_BITRATE, options=FFMPEG_OPTS), proc
 
     @staticmethod
     def _kill(proc: subprocess.Popen | None) -> None:
