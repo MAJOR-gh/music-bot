@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from importlib.metadata import PackageNotFoundError, version
+import platform
 import shutil
 import time
 from urllib.parse import urlparse
@@ -626,12 +628,39 @@ class MusicCog(commands.Cog):
                   else "🔗 прямой поток",
             inline=True,
         )
+        embed.add_field(
+            name="Аудиотракт (diag-v2)",
+            value="PCM → libopus discord.py" if config.AUDIO_BACKEND == "pcm"
+                  else "FFmpeg → Opus 20 мс",
+            inline=False,
+        )
+        try:
+            dave_version = version("davey")
+        except PackageNotFoundError:
+            dave_version = "не установлен"
+        try:
+            opus_version = discord.opus.Encoder.get_opus_version()
+        except discord.opus.OpusNotLoaded:
+            opus_version = "нет системной libopus (PCM недоступен)"
+        embed.add_field(
+            name="Аудиобиблиотеки",
+            value=f"discord.py `{discord.__version__}`\ndavey `{dave_version}`\n"
+                  f"Python `{platform.python_version()}`\nlibopus: {opus_version}",
+            inline=False,
+        )
+        if vc and vc.is_connected():
+            voice_ms = vc.latency * 1000
+            embed.add_field(
+                name="Voice Gateway (не потери UDP)",
+                value=fmt(voice_ms),
+                inline=True,
+            )
         embed.add_field(name="yt-dlp", value=f"`{updater.installed_version() or '—'}`", inline=True)
         embed.add_field(name="Куки YouTube", value=ytdl.cookies_mode() or "нет", inline=True)
         if ytdl.last_bot_check is not None:
             embed.add_field(
                 name="⚠️ Бот-проверка YouTube",
-                value=f"была <t:{int(ytdl.last_bot_check)}:R> — нужны свежие куки",
+                value=f"была <t:{int(ytdl.last_bot_check)}:R> — YouTube отказал в доступе",
                 inline=True,
             )
         embed.add_field(

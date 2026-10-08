@@ -181,7 +181,8 @@ class MusicPlayer:
                 artist, title = sources.split_artist_title(track.title, track.uploader)
             alt = await sources.soundcloud_alternative(artist, title, track.duration)
             if alt:
-                logger.info("[prepare] YouTube не отдал %r — играю с SoundCloud", track.title)
+                logger.info("[prepare] YouTube не отдал %r — играю с SoundCloud: %s",
+                            track.title, alt)
                 path = MusicPlayer._tmp_path()
                 if await ytdl.download(alt, path, timeout):
                     return Prepared("file", path=path)
@@ -267,16 +268,32 @@ class MusicPlayer:
             options=FFMPEG_OPTS, **kwargs)
 
     @staticmethod
+    async def _audio_source(source, **kwargs) -> discord.AudioSource:
+        """Переключаемый тракт для сравнения двух независимых кодировщиков."""
+        if config.AUDIO_BACKEND == "pcm":
+            try:
+                # Загружает libopus так же, как VoiceClient.play для PCM.
+                discord.opus.Encoder.get_opus_version()
+            except discord.opus.OpusNotLoaded as e:
+                raise RuntimeError(
+                    "AUDIO_BACKEND=pcm требует системную libopus. "
+                    "Установите её на машине бота (Debian/Ubuntu: libopus0) "
+                    "или верните AUDIO_BACKEND=opus."
+                ) from e
+            return discord.FFmpegPCMAudio(source, options="-vn", **kwargs)
+        return await MusicPlayer._opus_source(source, **kwargs)
+
+    @staticmethod
     async def _make_source(prepared: Prepared):
         """→ (AudioSource, процесс yt-dlp для pipe или None)."""
         if prepared.kind == "direct":
-            src = await MusicPlayer._opus_source(prepared.url, before_options=FFMPEG_BEFORE_OPTS)
+            src = await MusicPlayer._audio_source(prepared.url, before_options=FFMPEG_BEFORE_OPTS)
             return src, None
         if prepared.kind == "file":
-            return await MusicPlayer._opus_source(prepared.path), None
+            return await MusicPlayer._audio_source(prepared.path), None
         proc = ytdl.spawn_pipe(prepared.url)
         try:
-            src = await MusicPlayer._opus_source(proc.stdout, pipe=True)
+            src = await MusicPlayer._audio_source(proc.stdout, pipe=True)
         except BaseException:
             MusicPlayer._kill(proc)
             if proc.stdout is not None:
@@ -411,8 +428,9 @@ class MusicPlayer:
                 continue
             self._playing = (prepared, pipe_proc)
             started_at = self._loop.time()
-            logger.info("[player] играет %r (%s) на сервере %s",
-                        track.title, prepared.kind, self.state.guild_id)
+            logger.info("[player] играет %r (%s, audio=%s, discord.py=%s) на сервере %s",
+                        track.title, prepared.kind, config.AUDIO_BACKEND,
+                        discord.__version__, self.state.guild_id)
             await self._notify(self._on_track_change)
             self.schedule_prefetch()
 

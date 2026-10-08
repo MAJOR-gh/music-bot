@@ -51,6 +51,12 @@ YTDLP_AUTO_UPDATE: bool = os.getenv("YTDLP_AUTO_UPDATE", "1").strip().lower() no
 # умирает через пару секунд, и бот молчит/панель исчезает.
 FORCE_PIPE: bool = os.getenv("FORCE_PIPE", "").strip().lower() in ("1", "true", "yes")
 
+# Диагностический выбор кодировщика. opus: FFmpeg выдаёт готовый Opus;
+# pcm: FFmpeg выдаёт PCM, а discord.py кодирует его системной libopus.
+AUDIO_BACKEND: str = os.getenv("AUDIO_BACKEND", "opus").strip().lower()
+if AUDIO_BACKEND not in ("opus", "pcm"):
+    raise ValueError("AUDIO_BACKEND должен быть opus или pcm")
+
 # Папка с ffmpeg.exe/ffprobe.exe. Если задана — добавляем её в PATH процесса,
 # чтобы discord.py нашёл и ffmpeg, и ffprobe без правки системного PATH.
 FFMPEG_DIR: str = os.getenv("FFMPEG_DIR", "").strip()
