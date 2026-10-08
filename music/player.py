@@ -6,7 +6,7 @@
      IP) скачиваем звук целиком во временный файл через yt-dlp.
   2. Пока играет трек, следующий в очереди готовится заранее (prefetch) —
      между треками нет паузы на скачивание.
-  3. Звук отдаётся в Discord через FFmpeg; Opus копируется без перекодирования.
+  3. FFmpeg приводит любой источник к stereo Opus 48 кГц с пакетами по 20 мс.
 """
 from __future__ import annotations
 
@@ -35,10 +35,11 @@ FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 "
     "-reconnect_delay_max 5 -rw_timeout 15000000"
 )
-FFMPEG_OPTS = "-vn"
-# Битрейт (кбит/с), когда звук приходится перекодировать в Opus (AAC/MP3 с
-# SoundCloud, часть форматов YouTube). from_probe из discord.py ставит здесь
-# НЕ МЕНЬШЕ 512 — выходят пакеты по ~1200 байт, Discord их режет, звук хрипит.
+# discord.py отправляет один пакет каждые 20 мс и увеличивает RTP timestamp
+# на 960 samples. Копирование исходного Opus НЕ меняет длину пакетов и число
+# каналов: входные 40/60 мс не подходят этому таймингу. Всегда перекодируем.
+FFMPEG_OPTS = "-vn -frame_duration 20"
+# Умеренный битрейт выходного stereo Opus (кбит/с).
 ENCODE_BITRATE = 128
 
 # «Прямые ссылки googlevideo не работают» — запоминаем на весь процесс (сеть
@@ -90,6 +91,16 @@ async def _stream_reachable(url: str) -> bool:
                 return resp.status in (200, 206)
     except Exception:  # noqa: BLE001
         return False
+
+
+class DiscordOpusAudio(discord.FFmpegOpusAudio):
+    """В голос отправляем Opus-аудио, а не служебные заголовки Ogg."""
+
+    def read(self) -> bytes:
+        while True:
+            packet = super().read()
+            if not packet.startswith((b"OpusHead", b"OpusTags")):
+                return packet
 
 
 class MusicPlayer:
@@ -245,10 +256,15 @@ class MusicPlayer:
     # ── Источник звука ────────────────────────────────────────────────────
     @staticmethod
     async def _opus_source(source: str, **kwargs) -> discord.FFmpegOpusAudio:
-        """Opus копируем как есть, всё остальное кодируем в ENCODE_BITRATE."""
-        codec, _ = await discord.FFmpegOpusAudio.probe(source)
-        return discord.FFmpegOpusAudio(
-            source, codec=codec, bitrate=ENCODE_BITRATE, options=FFMPEG_OPTS, **kwargs)
+        """Любой источник → stereo Opus 48 кГц, 128 кбит/с, пакеты по 20 мс.
+
+        codec=None принудительно включает libopus. В discord.py значения
+        "opus", "libopus" и "copy" включают stream copy и оставляют
+        неподходящие размеры пакетов.
+        """
+        return DiscordOpusAudio(
+            source, codec=None, bitrate=ENCODE_BITRATE,
+            options=FFMPEG_OPTS, **kwargs)
 
     @staticmethod
     async def _make_source(prepared: Prepared):
@@ -259,8 +275,14 @@ class MusicPlayer:
         if prepared.kind == "file":
             return await MusicPlayer._opus_source(prepared.path), None
         proc = ytdl.spawn_pipe(prepared.url)
-        return discord.FFmpegOpusAudio(
-            proc.stdout, pipe=True, bitrate=ENCODE_BITRATE, options=FFMPEG_OPTS), proc
+        try:
+            src = await MusicPlayer._opus_source(proc.stdout, pipe=True)
+        except BaseException:
+            MusicPlayer._kill(proc)
+            if proc.stdout is not None:
+                proc.stdout.close()
+            raise
+        return src, proc
 
     @staticmethod
     def _kill(proc: subprocess.Popen | None) -> None:
