@@ -38,10 +38,11 @@ def suggestion_label(r: SearchResult) -> str:
 
 
 def suggestion_value(r: SearchResult) -> str:
-    """Что вернёт Discord при выборе подсказки (≤100 символов): ссылка или «lastfm:…»."""
+    """Что вернёт Discord при выборе подсказки (≤100 символов): ссылка или «spotify:…»."""
     if r.url and len(r.url) <= 100:
         return r.url
-    return ("lastfm:" + f"{r.uploader or ''} - {r.title}".strip(" -"))[:100]
+    prefix = sources.normalize_source(r.source) if r.source else "track"
+    return (f"{prefix}:" + f"{r.uploader or ''} - {r.title}".strip(" -"))[:100]
 
 
 SOURCE_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in sources.SOURCES.items()]
@@ -415,15 +416,14 @@ class MusicCog(commands.Cog):
             cache[key] = cache.pop(key)  # LRU: свежий — в конец
             return cache[key]
         if source == "lastfm":
-            results = await asyncio.wait_for(
-                sources.search_lastfm(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
-            for r in results:
-                # У Last.fm нет ссылки на звук — в value кладём «lastfm:…», а сам
-                # трек плеер найдёт на YouTube Music перед игрой.
-                r.url = None
+            search = sources.search_lastfm
+        elif source == "spotify":
+            search = sources.search_spotify
         else:
-            results = await asyncio.wait_for(
-                sources.search_ytmusic(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
+            search = sources.search_ytmusic
+        # У Spotify/Last.fm нет ссылки на звук: в value уйдёт «spotify:…»/«lastfm:…»,
+        # а сам трек плеер найдёт на YouTube Music перед игрой.
+        results = await asyncio.wait_for(search(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
         cache[key] = results
         for r in results:
             self._ac_results[suggestion_value(r)] = r
@@ -435,11 +435,17 @@ class MusicCog(commands.Cog):
 
     @staticmethod
     def _suggest_source(interaction: discord.Interaction) -> str:
-        """Откуда подсказки: Last.fm, если он выбран (или стоит по умолчанию) и настроен."""
+        """Откуда подсказки: source (или DEFAULT_SEARCH) без учёта регистра.
+
+        Spotify/Last.fm — у них (если заданы ключи), иначе — YouTube Music:
+        поиск самого YouTube через yt-dlp не успевает в 3 секунды автокомплита.
+        """
         ns = getattr(interaction, "namespace", None)
-        chosen = getattr(ns, "source", None) or config.DEFAULT_SEARCH
+        chosen = sources.normalize_source(getattr(ns, "source", None) or config.DEFAULT_SEARCH)
         if chosen == "lastfm" and config.LASTFM_API_KEY:
             return "lastfm"
+        if chosen == "spotify" and config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET:
+            return "spotify"
         return "ytmusic"
 
     async def play_autocomplete(
@@ -523,9 +529,7 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(self.enqueue_message(was_idle, track))
             return
 
-        key = source.value if source else config.DEFAULT_SEARCH
-        if key not in sources.SOURCES:
-            key = "youtube"
+        key = sources.normalize_source(source.value if source else config.DEFAULT_SEARCH)
         label = sources.SOURCES[key]
         try:
             results = await sources.search(key, query, 1)

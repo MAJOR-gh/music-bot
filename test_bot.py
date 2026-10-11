@@ -508,8 +508,25 @@ async def test_play_autocomplete():
         assert track.match == ("Imagine Dragons", "Bones") and track.webpage_url is None
         cfg.LASTFM_API_KEY = ""                    # без ключа — обычные подсказки YT Music
         assert MusicCog._suggest_source(inter) == "ytmusic"
+
+        async def fake_spotify(query, limit):
+            return [SearchResult(title="Bones", url=None, duration=165,
+                                 uploader="Imagine Dragons", source="Spotify")]
+        orig_sp = sources.search_spotify, cfg.SPOTIFY_CLIENT_ID, cfg.SPOTIFY_CLIENT_SECRET
+        sources.search_spotify, cfg.SPOTIFY_CLIENT_ID, cfg.SPOTIFY_CLIENT_SECRET = fake_spotify, "i", "s"
+        try:
+            inter.namespace.source = "SpOtIfY"
+            choices = await MusicCog(None, 60).play_autocomplete(inter, "bones")
+            assert [c.value for c in choices] == ["spotify:Imagine Dragons - Bones"], choices
+            assert choices[0].name == "Bones - Imagine Dragons (2:45)"
+        finally:
+            sources.search_spotify, cfg.SPOTIFY_CLIENT_ID, cfg.SPOTIFY_CLIENT_SECRET = orig_sp
     finally:
         sources.search_lastfm, cfg.LASTFM_API_KEY = orig_lfm, orig_key
+    for raw, want in [("Last.fm", "lastfm"), ("LAST FM", "lastfm"), ("lastfm", "lastfm"),
+                      ("Spotify", "spotify"), ("YouTube Music", "ytmusic"), ("YTMusic", "ytmusic"),
+                      ("YouTube", "youtube"), ("что-то", "youtube"), ("", "youtube"), (None, "youtube")]:
+        assert sources.normalize_source(raw) == want, (raw, sources.normalize_source(raw))
 
 
 async def test_page_reload_retries_with_alt_clients():
