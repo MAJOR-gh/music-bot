@@ -141,5 +141,31 @@ class EncoderOptionsTests(unittest.TestCase):
         self.assertEqual(opts[opts.index('-packet_loss') + 1], '0')
 
 
+class CopyDecisionTests(unittest.TestCase):
+    """Opus 20 мс (как у YouTube) копируем без потерь, остальное перекодируем."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        base = ['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                'sine=frequency=440:duration=2', '-ac', '2', '-c:a', 'libopus']
+        cls.opus20 = str(Path(cls.tmp.name) / 'o20.webm')
+        cls.opus60 = str(Path(cls.tmp.name) / 'o60.webm')
+        cls.aac = str(Path(cls.tmp.name) / 'a.m4a')
+        subprocess.run(base + ['-frame_duration', '20', cls.opus20], check=True)
+        subprocess.run(base + ['-frame_duration', '60', cls.opus60], check=True)
+        subprocess.run(base[:-2] + ['-c:a', 'aac', cls.aac], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_copy_only_20ms_opus(self):
+        self.assertTrue(asyncio.run(MusicPlayer._can_copy(self.opus20)))
+        self.assertFalse(asyncio.run(MusicPlayer._can_copy(self.opus60)))
+        self.assertFalse(asyncio.run(MusicPlayer._can_copy(self.aac)))
+        self.assertFalse(asyncio.run(MusicPlayer._can_copy('/nonexistent.webm')))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

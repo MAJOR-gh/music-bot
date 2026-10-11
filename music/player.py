@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import json
 import logging
 import os
 import subprocess
@@ -37,15 +38,20 @@ FFMPEG_BEFORE_OPTS = (
 )
 # discord.py отправляет один пакет каждые 20 мс и увеличивает RTP timestamp
 # на 960 samples. Копирование исходного Opus НЕ меняет длину пакетов и число
-# каналов: входные 40/60 мс не подходят этому таймингу. Всегда перекодируем.
+# каналов: входные 40/60 мс не подходят этому таймингу. Такие перекодируем (см. _can_copy).
 # discord.py (FFmpegOpusAudio) жёстко добавляет «-fec true -packet_loss 15»:
 # libopus резервирует часть битрейта под избыточность на 15% потерь, и при
 # перекодировании музыки слышен хрип (замер на тоне: SNR 20 дБ против 37–44 дБ).
 # Наши options идут после аргументов discord.py, поэтому последнее значение
 # выигрывает — выключаем FEC и ожидаемые потери.
 FFMPEG_OPTS = "-vn -frame_duration 20 -fec false -packet_loss 0"
-# Умеренный битрейт выходного stereo Opus (кбит/с).
-ENCODE_BITRATE = 128
+# Для stream copy encoder-опции libopus не нужны.
+COPY_OPTS = "-vn"
+# Битрейт перекодирования (кбит/с). 128 заметно портит уже сжатые AAC/MP3
+# (двойное сжатие); 256 — запас качества, пакеты ~640 байт.
+ENCODE_BITRATE = int(os.getenv("AUDIO_BITRATE", "256"))
+# Сколько первых пакетов проверять перед stream copy.
+PROBE_PACKETS = 50
 
 # «Прямые ссылки googlevideo не работают» — запоминаем на весь процесс (сеть
 # не меняется). FORCE_PIPE=1 выставляет сразу: на датацентровых IP и через
@@ -260,16 +266,51 @@ class MusicPlayer:
 
     # ── Источник звука ────────────────────────────────────────────────────
     @staticmethod
-    async def _opus_source(source: str, **kwargs) -> discord.FFmpegOpusAudio:
-        """Любой источник → stereo Opus 48 кГц, 128 кбит/с, пакеты по 20 мс.
+    async def _can_copy(source: str, before_options: str | None = None) -> bool:
+        """Можно ли отдать Opus без перекодирования (как в v1, звук без потерь).
 
-        codec=None принудительно включает libopus. В discord.py значения
-        "opus", "libopus" и "copy" включают stream copy и оставляют
-        неподходящие размеры пакетов.
+        Да, если это Opus 48 кГц и все первые пакеты ровно по 20 мс — именно так
+        отдаёт YouTube (формат 251). Иначе (AAC/MP3 с SoundCloud, Opus 40/60 мс)
+        перекодируем.
         """
+        args = ["ffprobe", "-v", "error"]
+        if before_options:
+            args += before_options.split()
+        args += ["-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name,sample_rate:packet=duration_time",
+                 "-read_intervals", f"%+#{PROBE_PACKETS}", "-of", "json", source]
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(proc.communicate(), 15)
+            data = json.loads(out or b"{}")
+            stream = (data.get("streams") or [{}])[0]
+            if stream.get("codec_name") != "opus" or str(stream.get("sample_rate")) != "48000":
+                return False
+            durs = [p.get("duration_time") for p in data.get("packets", [])]
+            return bool(durs) and all(d is not None and abs(float(d) - 0.02) < 1e-4 for d in durs)
+        except Exception as e:  # noqa: BLE001
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+            logger.debug("[probe] %s", e)
+            return False
+
+    @staticmethod
+    async def _opus_source(source, *, pipe: bool = False, **kwargs) -> discord.FFmpegOpusAudio:
+        """Источник → Opus 48 кГц с пакетами по 20 мс.
+
+        Opus 20 мс (YouTube) копируется как есть — без потери качества.
+        Остальное перекодируется в stereo Opus ENCODE_BITRATE без FEC.
+        codec=None принудительно включает libopus.
+        """
+        if not pipe and await MusicPlayer._can_copy(source, kwargs.get("before_options")):
+            logger.info("[audio] Opus 20 мс — копирую без перекодирования")
+            return DiscordOpusAudio(source, codec="copy", options=COPY_OPTS, **kwargs)
+        logger.info("[audio] перекодирую в Opus %s кбит/с", ENCODE_BITRATE)
         return DiscordOpusAudio(
             source, codec=None, bitrate=ENCODE_BITRATE,
-            options=FFMPEG_OPTS, **kwargs)
+            options=FFMPEG_OPTS, pipe=pipe, **kwargs)
 
     @staticmethod
     async def _make_source(prepared: Prepared):
