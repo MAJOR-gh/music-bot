@@ -448,6 +448,12 @@ def test_soundcloud_picks_matching_track():
         assert urls == ["sc/full"], urls   # 30-секундный отрывок Go+ пропущен
         assert "preview" in ytdl.format_for("https://api.soundcloud.com/tracks/1")
         assert ytdl.format_for("https://youtu.be/x") == "bestaudio/best"
+        from music import updater
+        pypi = {"info": {"version": "2026.8.19"}, "releases": {
+            "2026.8.19": [{}], "2026.10.10.233141.dev0": [{}], "2026.11.1": [{"yanked": True}]}}
+        assert updater.pick_latest(pypi, False) == "2026.8.19"
+        assert updater.pick_latest(pypi, True) == "2026.10.10.233141.dev0"
+        assert updater.version_tuple("2026.10.10.233141.dev0") > updater.version_tuple("2026.8.19")
     finally:
         ytdl.extract = real
 
@@ -556,7 +562,7 @@ async def test_page_reload_retries_with_alt_clients():
 
     async def fake_run_once(args, timeout):
         calls.append(args)
-        if len(calls) < 5:
+        if len(calls) <= next(i for i, a in enumerate(ytdl.ATTEMPTS) if a.music):
             raise ytdl.YtdlError("ERROR: The page needs to be reloaded.")
         return b"{}"
 

@@ -3,6 +3,8 @@
 YouTube регулярно меняет защиту, и через несколько недель старый yt-dlp
 получает 403 на скачивание звука — трек пропадает или рвётся. Поэтому при
 старте и раз в 12 часов сверяемся с PyPI и при необходимости обновляемся.
+По умолчанию ставим ночные сборки (nightly): исправления под YouTube выходят
+в них сразу, а в стабильную версию — через недели. YTDLP_NIGHTLY=0 — только stable.
 Бот вызывает yt-dlp отдельными процессами (ytdl.py), так что новая версия
 работает сразу, без перезапуска.
 """
@@ -21,6 +23,7 @@ logger = logging.getLogger("music_bot.updater")
 
 CHECK_EVERY = 12 * 60 * 60
 PACKAGES = ["yt-dlp", "yt-dlp-ejs"]
+NIGHTLY = os.getenv("YTDLP_NIGHTLY", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def installed_version() -> str | None:
@@ -43,10 +46,20 @@ async def latest_version() -> str | None:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
             async with s.get("https://pypi.org/pypi/yt-dlp/json") as resp:
                 if resp.status == 200:
-                    return (await resp.json())["info"]["version"]
+                    return pick_latest(await resp.json(), NIGHTLY)
     except Exception as e:  # noqa: BLE001
         logger.warning("[update] PyPI недоступен: %s", e)
     return None
+
+
+def pick_latest(data: dict, nightly: bool) -> str | None:
+    """Последняя версия из ответа PyPI; с nightly — включая .dev-сборки."""
+    stable = (data.get("info") or {}).get("version")
+    if not nightly:
+        return stable
+    versions = [v for v, files in (data.get("releases") or {}).items()
+                if files and not all(f.get("yanked") for f in files)]
+    return max(versions + ([stable] if stable else []), key=version_tuple, default=stable)
 
 
 def _pip_target_args() -> list[str]:
@@ -67,7 +80,8 @@ async def update_if_needed() -> None:
     logger.info("[update] yt-dlp %s устарел, ставлю %s…", current, latest)
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "pip", "install", "-U", "--quiet",
-        "--disable-pip-version-check", *_pip_target_args(), *PACKAGES,
+        "--disable-pip-version-check", *(["--pre"] if NIGHTLY else []),
+        *_pip_target_args(), *PACKAGES,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:

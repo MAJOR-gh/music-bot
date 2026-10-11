@@ -60,6 +60,8 @@ ATTEMPTS: tuple[Attempt, ...] = (
     # Совет мейнтейнеров yt-dlp для кук.
     Attempt("default + web_embedded",
             ("--extractor-args", "youtube:player_client=default,web_embedded")),
+    # Новый клиент из yt-dlp nightly 2026.10.10 — исправление yt-dlp#17389.
+    Attempt("tv_samsung", ("--extractor-args", "youtube:player_client=tv_samsung")),
     # Без сломанного tv_downgraded.
     Attempt("web + web_embedded без tv",
             ("--extractor-args", "youtube:player_client=web,web_embedded,-tv_downgraded")),
