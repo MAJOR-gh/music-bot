@@ -34,7 +34,9 @@ class YtdlError(Exception):
 # «The page needs to be reloaded» (yt-dlp#17405) и «Requested format is not
 # available» зависят от player_client. Перебираем способы по очереди и
 # запоминаем сработавший — следующие треки сразу идут через него.
-RETRY_MARKERS = ("page needs to be reloaded", "requested format is not available")
+RETRY_MARKERS = ("page needs to be reloaded", "requested format is not available",
+                 # попытки без кук с IP хостинга могут упереться в проверку на бота
+                 "confirm you\u2019re not a bot", "confirm you're not a bot")
 # Ручная настройка клиентов для всех запросов (по умолчанию пусто — как yt-dlp).
 EXTRACTOR_ARGS = os.getenv("YTDLP_EXTRACTOR_ARGS", "").strip()
 
@@ -45,6 +47,9 @@ class Attempt:
     extra: tuple[str, ...] = ()
     music: bool = False          # открыть ролик как music.youtube.com
 
+
+# Отключает куки для отдельной попытки (последний флаг в командной строке побеждает).
+_NO_COOKIES = ("--no-cookies", "--no-cookies-from-browser")
 
 # Источник обходов — yt-dlp#17389: с куками ломается клиент tv_downgraded
 # («page needs to be reloaded»), а на части аккаунтов это происходит всегда.
@@ -62,8 +67,16 @@ ATTEMPTS: tuple[Attempt, ...] = (
     Attempt("YouTube Music (web_music)",
             ("--extractor-args", "youtube:player_client=web_music"), music=True),
     Attempt("web_safari", ("--extractor-args", "youtube:player_client=web_safari")),
+    # «page needs to be reloaded» привязана к сессии аккаунта: без кук её нет,
+    # а от проверки на бота с IP хостинга иногда спасает PO Token.
+    Attempt("без кук: mweb + PO Token",
+            _NO_COOKIES + ("--extractor-args", "youtube:player_client=mweb")),
 )
 _preferred = 0   # индекс способа, сработавшего последним
+# Если не сработал ни один способ, следующие ~10 минут пробуем только один,
+# чтобы не ждать по минуте перед запасным SoundCloud на каждом треке.
+COOLDOWN = 600.0
+_all_failed_at = 0.0
 
 
 _YT_ID_RE = re.compile(r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)([\w-]{11})")
@@ -85,6 +98,8 @@ def _plan(url: str) -> list[tuple[int, list[str], str]]:
     if vid is None:                       # не YouTube (SoundCloud и т. п.) — одна попытка
         return [(0, [], url)]
     order = [_preferred] + [i for i in range(len(ATTEMPTS)) if i != _preferred]
+    if _all_failed_at and time.monotonic() - _all_failed_at < COOLDOWN:
+        order = order[:1]
     plan = []
     for i in order:
         att = ATTEMPTS[i]
@@ -208,7 +223,7 @@ async def _run_once(args: list[str], timeout: float) -> bytes:
 
 async def extract(target: str, *, flat: bool = False, timeout: float = 60) -> dict:
     """Метаданные по ссылке или запросу (`ytsearch5:…`). flat — без похода в каждое видео."""
-    args = base_args() + ["-J", "-f", "bestaudio/best"]
+    args = base_args() + ["-J", "-f", format_for(target)]
     if flat:
         args.append("--flat-playlist")
     args.append(target)
@@ -239,7 +254,16 @@ def best_thumbnail(info: dict) -> str | None:
 
 def download_cmd(url: str) -> list[str]:
     """Команда: лучший звук трека → stdout."""
-    return base_args() + ["-f", "bestaudio/best", "--quiet", "-o", "-", url]
+    return base_args() + ["-f", format_for(url), "--quiet", "-o", "-", url]
+
+
+# SoundCloud отдаёт за трек Go+ только 30-секундный отрывок (format_id «preview»).
+# Такой формат не берём: пусть лучше скачивание упадёт и бот возьмёт другой трек.
+_SC_FORMAT = "bestaudio[format_id!*=preview]/best[format_id!*=preview]"
+
+
+def format_for(url: str) -> str:
+    return _SC_FORMAT if "soundcloud.com" in (url or "") else "bestaudio/best"
 
 
 async def download(url: str, path: str, timeout: float = 300) -> bool:
@@ -248,17 +272,23 @@ async def download(url: str, path: str, timeout: float = 300) -> bool:
     При любой неудаче и при отмене (трек убрали из очереди) файл удаляется.
     На плавающих отказах YouTube перебирает клиенты (см. ATTEMPTS).
     """
+    global _all_failed_at
     plan = _plan(url)
     for n, (i, extra, target) in enumerate(plan):
         ok, message = await _download_once(target, path, timeout, extra)
         if ok:
-            if len(plan) > 1:
+            if len(plan) > 1 or _all_failed_at:
                 _remember(i)
+            _all_failed_at = 0.0
             return True
         if not _should_retry(message):
             return False
         if n == len(plan) - 1:
-            await _log_diagnosis(url)
+            if len(plan) > 1:
+                _all_failed_at = time.monotonic()
+                logger.info("[youtube] все способы отказали — %d мин пробую только «%s», "
+                            "дальше снова все", int(COOLDOWN // 60), ATTEMPTS[_preferred].name)
+                await _log_diagnosis(url)
             return False
         logger.info("[download] пробую: %s", ATTEMPTS[plan[n + 1][0]].name)
     return False

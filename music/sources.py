@@ -85,17 +85,30 @@ def split_artist_title(title: str, uploader: str | None = None) -> tuple[str, st
 
 async def soundcloud_alternative(artist: str, title: str,
                                  duration: int | None = None) -> str | None:
-    """Ссылка на ту же песню на SoundCloud (запасной вариант, если YouTube отказал).
+    """Лучшая ссылка из soundcloud_alternatives() или None."""
+    found = await soundcloud_alternatives(artist, title, duration)
+    return found[0] if found else None
 
-    Берём лучшее совпадение по названию/исполнителю/длительности, а не первое
+
+def _is_preview(r: SearchResult, duration: int | None) -> bool:
+    """30-секундный отрывок трека Go+ вместо полной версии."""
+    return bool(r.duration and r.duration <= 31 and (duration or 0) > 45)
+
+
+async def soundcloud_alternatives(artist: str, title: str,
+                                  duration: int | None = None) -> list[str]:
+    """Ссылки на ту же песню на SoundCloud, от лучшей (запасной вариант, если YouTube отказал).
+
+    Берём только похожие по названию/исполнителю/длительности, а не первое
     попавшееся: лучше честно не сыграть, чем включить другую песню.
+    Отрывки по 30 секунд (треки Go+) пропускаем.
     """
     query = f"{artist} {title}".strip()
     try:
-        data = await ytdl.extract(f"scsearch5:{query}", flat=True, timeout=30)
+        data = await ytdl.extract(f"scsearch8:{query}", flat=True, timeout=30)
     except Exception as e:  # noqa: BLE001
         logger.warning("[soundcloud] %r: %s", query, e)
-        return None
+        return []
     found = []
     for e in (data or {}).get("entries") or []:
         url = e and (e.get("url") or e.get("webpage_url"))
@@ -104,13 +117,15 @@ async def soundcloud_alternative(artist: str, title: str,
                 title=e.get("title") or "", url=url, duration=_int(e.get("duration")),
                 uploader=e.get("uploader"), source="SoundCloud",
             ))
-    if not found:
-        return None
-    best = max(found, key=lambda r: match_score(r, artist, title, duration))
-    if match_score(best, artist, title, duration) < 2:
-        logger.info("[soundcloud] для %r нет похожего трека (лучший: %r)", query, best.title)
-        return None
-    return best.url
+    full = [r for r in found if not _is_preview(r, duration)]
+    if len(full) < len(found):
+        logger.info("[soundcloud] пропускаю 30-секундные отрывки: %d", len(found) - len(full))
+    good = sorted((r for r in full if match_score(r, artist, title, duration) >= 2),
+                  key=lambda r: -match_score(r, artist, title, duration))
+    if not good:
+        best = found[0].title if found else None
+        logger.info("[soundcloud] для %r нет похожего полного трека (первый: %r)", query, best)
+    return [r.url for r in good]
 
 
 # ── YouTube Music ─────────────────────────────────────────────────────────────
