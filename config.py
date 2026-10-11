@@ -70,9 +70,32 @@ YTDLP_COOKIES_FROM_BROWSER: str = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").st
 # Хостинги-панели (Pterodactyl) ставят пакеты через `pip --prefix .local`:
 # бинарники из pip (deno — JS-рантайм для yt-dlp) лежат в .local/bin,
 # которого нет в PATH.
-_LOCAL_BIN = os.path.join(_BOT_DIR, ".local", "bin")
-if os.path.isdir(_LOCAL_BIN):
-    os.environ["PATH"] = _LOCAL_BIN + os.pathsep + os.environ.get("PATH", "")
+# Бот может лежать в подпапке (/home/container/music-bot-main), а .local — в
+# корне контейнера или в текущей папке, поэтому смотрим и выше, и в cwd.
+def _local_bins() -> list[str]:
+    seen, out = set(), []
+    for base in (_BOT_DIR, os.path.dirname(_BOT_DIR), os.getcwd(), os.path.expanduser("~")):
+        d = os.path.join(base, ".local", "bin")
+        if d not in seen and os.path.isdir(d):
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+for _d in reversed(_local_bins()):
+    if _d not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
+
+# Последний шанс для deno: pip-пакет `deno` сам знает, где лежит его бинарник.
+if not shutil.which("deno"):
+    try:
+        import deno as _deno_pkg
+
+        _deno_bin = _deno_pkg.find_deno_bin()
+        if _deno_bin and os.path.isfile(_deno_bin):
+            os.environ["PATH"] = os.path.dirname(_deno_bin) + os.pathsep + os.environ.get("PATH", "")
+    except Exception:  # noqa: BLE001
+        pass
 
 # Нет системного ffmpeg (на панели не поставить apt) — берём статическую
 # сборку ffmpeg+ffprobe из пакета static-ffmpeg (скачивается при 1-м запуске).
