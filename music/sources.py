@@ -1,6 +1,6 @@
-"""Источники поиска: YouTube, YouTube Music, Spotify, Last.fm, SoundCloud.
+"""Источники поиска: YouTube, YouTube Music, Spotify, Last.fm (+ запасной SoundCloud).
 
-Звук всегда берётся с YouTube/SoundCloud (через yt-dlp). Spotify и Last.fm дают
+Звук берётся с YouTube через yt-dlp (SoundCloud — только если SOUNDCLOUD_FALLBACK=1). Spotify и Last.fm дают
 только «что за трек» (исполнитель + название) — такой трек плеер перед игрой
 находит на YouTube Music функцией find_on_ytmusic().
 """
@@ -81,13 +81,6 @@ def split_artist_title(title: str, uploader: str | None = None) -> tuple[str, st
             return artist.strip(), song.strip()
     artist = (uploader or "").removesuffix(" - Topic").strip()
     return artist, clean
-
-
-async def soundcloud_alternative(artist: str, title: str,
-                                 duration: int | None = None) -> str | None:
-    """Лучшая ссылка из soundcloud_alternatives() или None."""
-    found = await soundcloud_alternatives(artist, title, duration)
-    return found[0] if found else None
 
 
 def _is_preview(r: SearchResult, duration: int | None) -> bool:

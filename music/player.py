@@ -185,7 +185,7 @@ class MusicPlayer:
         if await ytdl.download(track.webpage_url, path, timeout):
             return Prepared("file", path=path)
         # YouTube отказал (403, «Sign in to confirm…») — ищем ту же песню на SoundCloud.
-        if "youtu" in (track.webpage_url or ""):
+        if config.SOUNDCLOUD_FALLBACK and "youtu" in (track.webpage_url or ""):
             if track.match:
                 artist, title = track.match
             else:
@@ -389,7 +389,7 @@ class MusicPlayer:
             if track is None:
                 try:
                     await asyncio.wait_for(self.state.next_event.wait(), timeout=self.idle_timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.info("[player] простой на сервере %s — отключаюсь", self.state.guild_id)
                     await self._on_disconnect(self.state.guild_id)
                     return

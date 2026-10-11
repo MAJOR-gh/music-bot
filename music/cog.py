@@ -37,6 +37,13 @@ def suggestion_label(r: SearchResult) -> str:
     return head + tail
 
 
+def suggestion_value(r: SearchResult) -> str:
+    """Что вернёт Discord при выборе подсказки (≤100 символов): ссылка или «lastfm:…»."""
+    if r.url and len(r.url) <= 100:
+        return r.url
+    return ("lastfm:" + f"{r.uploader or ''} - {r.title}".strip(" -"))[:100]
+
+
 SOURCE_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in sources.SOURCES.items()]
 
 
@@ -373,7 +380,7 @@ class MusicCog(commands.Cog):
         return None
 
     # ── /join ─────────────────────────────────────────────────────────────
-    @app_commands.command(name="join", description="Подключить бота к твоему голосовому каналу")
+    @app_commands.command(name="join", description="Позвать бота в твой голосовой канал")
     async def join(self, interaction: discord.Interaction):
         await interaction.response.defer()
         vc = await self._ensure_voice(interaction)
@@ -384,7 +391,7 @@ class MusicCog(commands.Cog):
         )
 
     # ── /leave ────────────────────────────────────────────────────────────
-    @app_commands.command(name="leave", description="Отключить бота и очистить очередь")
+    @app_commands.command(name="leave", description="Выгнать бота из канала и очистить очередь")
     async def leave(self, interaction: discord.Interaction):
         if interaction.guild.voice_client is None:
             await interaction.response.send_message(
@@ -401,23 +408,39 @@ class MusicCog(commands.Cog):
     _AC_TIMEOUT = 2.5
     _AC_CACHE_MAX = 200
 
-    async def _suggest(self, query: str) -> list[SearchResult]:
-        key = " ".join(query.lower().split())
+    async def _suggest(self, query: str, source: str = "ytmusic") -> list[SearchResult]:
+        key = source + "\0" + " ".join(query.lower().split())
         cache = self._ac_cache
         if key in cache:
             cache[key] = cache.pop(key)  # LRU: свежий — в конец
             return cache[key]
-        results = await asyncio.wait_for(
-            sources.search_ytmusic(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
+        if source == "lastfm":
+            results = await asyncio.wait_for(
+                sources.search_lastfm(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
+            for r in results:
+                # У Last.fm нет ссылки на звук — в value кладём «lastfm:…», а сам
+                # трек плеер найдёт на YouTube Music перед игрой.
+                r.url = None
+        else:
+            results = await asyncio.wait_for(
+                sources.search_ytmusic(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
         cache[key] = results
         for r in results:
-            if r.url:
-                self._ac_results[r.url] = r
+            self._ac_results[suggestion_value(r)] = r
         while len(cache) > self._AC_CACHE_MAX:
             cache.pop(next(iter(cache)))
         while len(self._ac_results) > self._AC_CACHE_MAX * 5:
             self._ac_results.pop(next(iter(self._ac_results)))
         return results
+
+    @staticmethod
+    def _suggest_source(interaction: discord.Interaction) -> str:
+        """Откуда подсказки: Last.fm, если он выбран (или стоит по умолчанию) и настроен."""
+        ns = getattr(interaction, "namespace", None)
+        chosen = getattr(ns, "source", None) or config.DEFAULT_SEARCH
+        if chosen == "lastfm" and config.LASTFM_API_KEY:
+            return "lastfm"
+        return "ytmusic"
 
     async def play_autocomplete(
         self, interaction: discord.Interaction, current: str,
@@ -426,19 +449,19 @@ class MusicCog(commands.Cog):
         if len(current) < 2 or _is_url(current):
             return []
         try:
-            results = await self._suggest(current)
+            results = await self._suggest(current, self._suggest_source(interaction))
         except Exception as e:  # noqa: BLE001 — таймаут/ошибка: просто без подсказок
             logger.debug("[autocomplete] %r: %s", current, e)
             return []
         return [
-            app_commands.Choice(name=suggestion_label(r), value=r.url)
-            for r in results if r.url and len(r.url) <= 100
+            app_commands.Choice(name=suggestion_label(r), value=suggestion_value(r))
+            for r in results
         ][:AUTOCOMPLETE_LIMIT]
 
-    @app_commands.command(name="play", description="Воспроизвести трек по ссылке или поисковому запросу")
+    @app_commands.command(name="play", description="Включить трек: ссылка или поиск с подсказками")
     @app_commands.describe(
-        query="Ссылка (YouTube, SoundCloud, Spotify) или текст для поиска",
-        source="Где искать текст (по умолчанию — YouTube)",
+        query="Ссылка (YouTube, YouTube Music, Spotify) или название — выбери из подсказок",
+        source="Где искать текст: YouTube, YouTube Music, Spotify или Last.fm",
     )
     @app_commands.choices(source=SOURCE_CHOICES)
     @app_commands.autocomplete(query=play_autocomplete)
@@ -532,7 +555,7 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(self.enqueue_message(was_idle, track))
 
     # ── /skip ─────────────────────────────────────────────────────────────
-    @app_commands.command(name="skip", description="Пропустить текущий трек")
+    @app_commands.command(name="skip", description="Следующий трек")
     async def skip_cmd(self, interaction: discord.Interaction):
         if not self.skip(interaction.guild):
             await interaction.response.send_message(
@@ -542,7 +565,7 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message("⏭️ Пропущено.")
 
     # ── /pause ────────────────────────────────────────────────────────────
-    @app_commands.command(name="pause", description="Поставить на паузу")
+    @app_commands.command(name="pause", description="Пауза")
     async def pause(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc is None or not vc.is_playing():
@@ -555,7 +578,7 @@ class MusicCog(commands.Cog):
         await self._rerender_panel(self.get_state(interaction.guild.id))
 
     # ── /resume ───────────────────────────────────────────────────────────
-    @app_commands.command(name="resume", description="Продолжить воспроизведение")
+    @app_commands.command(name="resume", description="Снять с паузы")
     async def resume(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc is None or not vc.is_paused():
@@ -568,7 +591,7 @@ class MusicCog(commands.Cog):
         await self._rerender_panel(self.get_state(interaction.guild.id))
 
     # ── /stop ─────────────────────────────────────────────────────────────
-    @app_commands.command(name="stop", description="Остановить и очистить очередь (бот остаётся в канале)")
+    @app_commands.command(name="stop", description="Остановить музыку и очистить очередь (бот остаётся в канале)")
     async def stop(self, interaction: discord.Interaction):
         if interaction.guild.voice_client is None:
             await interaction.response.send_message(
@@ -580,7 +603,7 @@ class MusicCog(commands.Cog):
         await self._remove_panel(self.get_state(interaction.guild.id))
 
     # ── /queue ────────────────────────────────────────────────────────────
-    @app_commands.command(name="queue", description="Показать очередь")
+    @app_commands.command(name="queue", description="Что дальше в очереди")
     async def queue(self, interaction: discord.Interaction):
         state = self.get_state(interaction.guild.id)
         if state.current is None and state.is_empty:
@@ -608,7 +631,7 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ── /nowplaying ───────────────────────────────────────────────────────
-    @app_commands.command(name="nowplaying", description="Что играет сейчас")
+    @app_commands.command(name="nowplaying", description="Что сейчас играет")
     async def nowplaying(self, interaction: discord.Interaction):
         state = self.get_state(interaction.guild.id)
         if state.current is None:
@@ -655,7 +678,7 @@ class MusicCog(commands.Cog):
         except Exception:  # noqa: BLE001
             return None
 
-    @app_commands.command(name="ping", description="Сервисная проверка: задержки, FFmpeg, режим доставки звука")
+    @app_commands.command(name="ping", description="Диагностика: задержки, yt-dlp, куки, память хостинга")
     async def ping(self, interaction: discord.Interaction):
         await interaction.response.defer()
 

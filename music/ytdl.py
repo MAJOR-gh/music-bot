@@ -43,9 +43,7 @@ class YtdlError(Exception):
 # «The page needs to be reloaded» (yt-dlp#17405) и «Requested format is not
 # available» зависят от player_client. Перебираем способы по очереди и
 # запоминаем сработавший — следующие треки сразу идут через него.
-RETRY_MARKERS = ("page needs to be reloaded", "requested format is not available",
-                 # попытки без кук с IP хостинга могут упереться в проверку на бота
-                 "confirm you\u2019re not a bot", "confirm you're not a bot")
+RETRY_MARKERS = ("page needs to be reloaded", "requested format is not available")
 # Ручная настройка клиентов для всех запросов (по умолчанию пусто — как yt-dlp).
 EXTRACTOR_ARGS = os.getenv("YTDLP_EXTRACTOR_ARGS", "").strip()
 
@@ -57,35 +55,25 @@ class Attempt:
     music: bool = False          # открыть ролик как music.youtube.com
 
 
-# Отключает куки для отдельной попытки (последний флаг в командной строке побеждает).
-_NO_COOKIES = ("--no-cookies", "--no-cookies-from-browser")
+def _client(name: str) -> tuple[str, ...]:
+    return ("--extractor-args", f"youtube:player_client={name}")
 
-# Источник обходов — yt-dlp#17389: с куками ломается клиент tv_downgraded
-# («page needs to be reloaded»), а на части аккаунтов это происходит всегда.
+
+# Только способы, которые реально выручали (yt-dlp#17389): с куками ломается
+# tv_downgraded («page needs to be reloaded»), лечится tv_samsung (yt-dlp nightly
+# 2026.10.10+) или музыкальным клиентом. Остальные варианты только тянули время.
 ATTEMPTS: tuple[Attempt, ...] = (
     Attempt("клиенты по умолчанию"),
-    # mweb отдаёт обычные https-форматы, если есть PO Token (music/pot.py).
-    Attempt("mweb + PO Token", ("--extractor-args", "youtube:player_client=mweb")),
-    # Совет мейнтейнеров yt-dlp для кук.
-    Attempt("default + web_embedded",
-            ("--extractor-args", "youtube:player_client=default,web_embedded")),
-    # Новый клиент из yt-dlp nightly 2026.10.10 — исправление yt-dlp#17389.
-    Attempt("tv_samsung", ("--extractor-args", "youtube:player_client=tv_samsung")),
-    # Без сломанного tv_downgraded.
-    Attempt("web + web_embedded без tv",
-            ("--extractor-args", "youtube:player_client=web,web_embedded,-tv_downgraded")),
-    # На «проблемных» аккаунтах в issue работал только музыкальный клиент.
-    Attempt("YouTube Music (web_music)",
-            ("--extractor-args", "youtube:player_client=web_music"), music=True),
-    Attempt("web_safari", ("--extractor-args", "youtube:player_client=web_safari")),
-    # «page needs to be reloaded» привязана к сессии аккаунта: без кук её нет,
-    # а от проверки на бота с IP хостинга иногда спасает PO Token.
-    Attempt("без кук: mweb + PO Token",
-            _NO_COOKIES + ("--extractor-args", "youtube:player_client=mweb")),
+    Attempt("tv_samsung", _client("tv_samsung")),
+    Attempt("default + web_embedded", _client("default,web_embedded")),
+    Attempt("YouTube Music (web_music)", _client("web_music"), music=True),
+) + (
+    # mweb отдаёт обычные https-форматы, только если есть PO Token (music/pot.py).
+    (Attempt("mweb + PO Token", _client("mweb")),) if pot.ENABLED else ()
 )
 _preferred = 0   # индекс способа, сработавшего последним
 # Если не сработал ни один способ, следующие ~10 минут пробуем только один,
-# чтобы не ждать по минуте перед запасным SoundCloud на каждом треке.
+# чтобы не ждать по полминуты на каждом треке.
 COOLDOWN = 600.0
 _all_failed_at = 0.0
 
@@ -241,7 +229,7 @@ async def extract(target: str, *, flat: bool = False, timeout: float = 60) -> di
     args.append(target)
     try:
         out = await _run(args, timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise YtdlError(f"таймаут {timeout:.0f}с") from None
     try:
         return json.loads(out)
@@ -341,7 +329,7 @@ async def _download_once(url: str, path: str, timeout: float,
             message = _last_error_line(err)
             note_error(message)
             logger.warning("[download] %s: %s", url, message)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("[download] %s: таймаут %.0fс", url, timeout)
     except OSError as e:
         logger.warning("[download] %s: %s", url, e)
