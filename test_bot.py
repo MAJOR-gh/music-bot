@@ -491,13 +491,13 @@ async def test_page_reload_retries_with_alt_clients():
         ytdl._preferred = 0
         assert await ytdl.download(url, "/tmp/x", 5)
         assert seen[0] == (url, [])
-        assert seen[1] == (url, ["--extractor-args", "youtube:player_client=default,web_embedded"])
-        assert "-tv_downgraded" in seen[2][1][1]
+        assert seen[1] == (url, ["--extractor-args", "youtube:player_client=mweb"])
+        assert seen[2][1] == ["--extractor-args", "youtube:player_client=default,web_embedded"]
         assert ytdl._preferred == 2                       # запомнил сработавший
         seen.clear()
         seen.append(None); seen.append(None)              # следующие вызовы — сразу успех
         assert await ytdl.download(url, "/tmp/x", 5)
-        assert "-tv_downgraded" in seen[2][1][1]
+        assert seen[2][1] == ["--extractor-args", "youtube:player_client=default,web_embedded"]
 
         seen.clear()
 
@@ -539,7 +539,7 @@ async def test_page_reload_retries_with_alt_clients():
 
     async def fake_run_once(args, timeout):
         calls.append(args)
-        if len(calls) < 4:
+        if len(calls) < 5:
             raise ytdl.YtdlError("ERROR: The page needs to be reloaded.")
         return b"{}"
 

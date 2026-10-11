@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 
 import discord
@@ -9,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from music import updater
+from music import pot, updater
 from music.cog import setup_cog
 from music.player import cleanup_stale_files
 
@@ -34,6 +35,7 @@ class MusicBot(commands.Bot):
         # предупреждение «Privileged message content intent is missing».
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self._updater_task: asyncio.Task | None = None
+        self._pot_task: asyncio.Task | None = None
         self.tree.on_error = self._on_app_command_error
 
     async def _on_app_command_error(
@@ -57,6 +59,9 @@ class MusicBot(commands.Bot):
             logger.info("Удалено %d временных файлов от прошлого запуска", removed)
         if config.YTDLP_AUTO_UPDATE:
             self._updater_task = asyncio.create_task(updater.updater_loop())
+        # PO Token для YouTube: без него клиенты с куками получают «page needs to be reloaded».
+        self._pot_task = asyncio.create_task(pot.run_forever())
+        atexit.register(pot.stop)
 
         await setup_cog(self, config.IDLE_TIMEOUT)
 
