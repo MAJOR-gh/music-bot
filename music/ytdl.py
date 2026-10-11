@@ -344,8 +344,11 @@ async def _download_once(url: str, path: str, timeout: float,
 async def diagnose(url: str) -> list[str]:
     """Короткая выжимка `yt-dlp -v` для лога, когда YouTube не отдал трек ни одним способом."""
     keys = ("JS runtimes", "Found YouTube account cookies", "playability status",
-            "formats have been skipped", "PO Token", "yt-dlp version", "ERROR")
-    args = base_args() + ["-v", "--simulate", "-f", "bestaudio/best", url]
+            "formats have been skipped", "PO Token", "yt-dlp version", "ERROR",
+            "WARNING", "[jsc", "challenge", "solver", "player API JSON", "player JS")
+    # Без --no-warnings: самое важное (провал JS-challenge и т. п.) идёт предупреждениями.
+    args = [a for a in base_args() if a != "--no-warnings"]
+    args += ["-v", "--simulate", "-f", "bestaudio/best", url]
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=_ENV)
@@ -357,7 +360,7 @@ async def diagnose(url: str) -> list[str]:
     for ln in lines:
         if any(k in ln for k in keys):
             out.append(ln.strip()[:220])
-    return out[-15:]
+    return out[-30:]
 
 
 def js_runtime() -> str | None:
