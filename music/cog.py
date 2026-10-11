@@ -244,7 +244,7 @@ class MusicCog(commands.Cog):
 
         upcoming = state.upcoming[:5]
         if upcoming:
-            lines = [f"`{i}.` {short_title(t.title)} `[{t.duration_str}]`"
+            lines = [f"`{i}.` {short_title(t.display_title)}{t.duration_tag}"
                      for i, t in enumerate(upcoming, start=1)]
             embed.add_field(name="📋 Далее в очереди", value=_field(lines, len(state)), inline=False)
         if state.repeat is not RepeatMode.OFF:
@@ -348,9 +348,26 @@ class MusicCog(commands.Cog):
 
     @staticmethod
     def enqueue_message(was_idle: bool, track: Track) -> str:
-        if was_idle:
-            return f"▶️ Запускаю: **{short_title(track.title, 100)}** `[{track.duration_str}]`"
-        return f"➕ В очередь: **{short_title(track.title, 100)}** `[{track.duration_str}]`"
+        head = "▶️ Запускаю" if was_idle else "➕ В очередь"
+        return f"{head}: **{short_title(track.display_title, 100)}**{track.duration_tag}"
+
+    async def _resolve(self, interaction: discord.Interaction, track: Track) -> bool:
+        """Трек из Spotify/Last.fm → сразу найти его на YouTube Music.
+
+        Так в чате видна настоящая длительность, а если трека нет — пишем об этом
+        сразу, а не молча пропускаем его в очереди.
+        """
+        if track.webpage_url or not track.match:
+            return True
+        try:
+            ok = await asyncio.wait_for(MusicPlayer._fill_from_match(track), 10)
+        except Exception as e:  # noqa: BLE001 — не успели: найдёт плеер перед игрой
+            logger.info("[play] YT Music не ответил вовремя для %r: %s", track.title, e)
+            return True
+        if not ok:
+            await interaction.followup.send(
+                f"❌ Не нашёл на YouTube Music: **{short_title(track.display_title, 100)}**")
+        return ok
 
     async def _track_from_url(self, url: str, requester: str) -> Track | None:
         """Ссылка YouTube/SoundCloud/… → Track с названием и длительностью."""
@@ -513,6 +530,8 @@ class MusicCog(commands.Cog):
         picked = self._ac_results.get(query)
         if picked is not None:
             track = picked.to_track(requester)
+            if not await self._resolve(interaction, track):
+                return
             was_idle = await self.enqueue(interaction, [track])
             if was_idle is not None:
                 await interaction.followup.send(self.enqueue_message(was_idle, track))
@@ -554,6 +573,8 @@ class MusicCog(commands.Cog):
             return
 
         track = results[0].to_track(requester)
+        if not await self._resolve(interaction, track):
+            return
         was_idle = await self.enqueue(interaction, [track])
         if was_idle is not None:
             await interaction.followup.send(self.enqueue_message(was_idle, track))
@@ -620,13 +641,13 @@ class MusicCog(commands.Cog):
         if state.current:
             embed.add_field(
                 name="Сейчас играет",
-                value=f"**{short_title(state.current.title, 200)}** `[{state.current.duration_str}]`",
+                value=f"**{short_title(state.current.display_title, 200)}**{state.current.duration_tag}",
                 inline=False,
             )
         upcoming = state.upcoming[:10]
         if upcoming:
             lines = [
-                f"`{i}.` {short_title(t.title)} `[{t.duration_str}]` — {short_title(t.requested_by, 32)}"
+                f"`{i}.` {short_title(t.display_title)}{t.duration_tag} — {short_title(t.requested_by, 32)}"
                 for i, t in enumerate(upcoming, start=1)
             ]
             embed.add_field(name="Далее", value=_field(lines, len(state)), inline=False)
