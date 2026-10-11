@@ -471,6 +471,52 @@ async def test_play_autocomplete():
         sources.search_ytmusic = orig
     assert suggestion_label(SearchResult(title="T", url=None, duration=None, uploader=None)) == "T"
 
+
+async def test_page_reload_retries_with_alt_clients():
+    """«The page needs to be reloaded»: повтор, затем запасные player_client."""
+    seen = []
+
+    async def fake_once(url, path, timeout, extra):
+        seen.append(extra)
+        if len(seen) < 3:
+            return False, "ERROR: [youtube] x: The page needs to be reloaded."
+        return True, None
+
+    orig = ytdl._download_once
+    ytdl._download_once = fake_once
+    try:
+        assert await ytdl.download("https://www.youtube.com/watch?v=x", "/tmp/x", 5)
+        assert seen[0] == [] and seen[1] == []
+        assert seen[2][0] == "--extractor-args" and "web_safari" in seen[2][1]
+        # Другая ошибка — без повторов.
+        seen.clear()
+
+        async def other(url, path, timeout, extra):
+            seen.append(extra)
+            return False, "ERROR: Video unavailable"
+        ytdl._download_once = other
+        assert not await ytdl.download("https://www.youtube.com/watch?v=x", "/tmp/x", 5)
+        assert len(seen) == 1
+    finally:
+        ytdl._download_once = orig
+
+    calls = []
+
+    async def fake_run_once(args, timeout):
+        calls.append(args)
+        if len(calls) < 3:
+            raise ytdl.YtdlError("ERROR: The page needs to be reloaded.")
+        return b"{}"
+
+    orig_run = ytdl._run_once
+    ytdl._run_once = fake_run_once
+    try:
+        assert await ytdl.extract("https://www.youtube.com/watch?v=x") == {}
+        assert calls[-1][-1] == "https://www.youtube.com/watch?v=x"
+        assert "--extractor-args" in calls[-1] and "--extractor-args" not in calls[0]
+    finally:
+        ytdl._run_once = orig_run
+
 ASYNC_TESTS = [
     test_plays_queue_in_order,
     test_second_enqueue_does_not_cut_current,
@@ -488,6 +534,7 @@ ASYNC_TESTS = [
     test_player_survives_new_voice_client,
     test_leave_cancels_player_and_cleans_up,
     test_play_autocomplete,
+    test_page_reload_retries_with_alt_clients,
 ]
 SYNC_TESTS = [test_helpers, test_spotify_parsing, test_match_score_prefers_right_song,
               test_split_artist_title, test_bot_check_detected, test_soundcloud_picks_matching_track,
