@@ -436,6 +436,18 @@ def test_soundcloud_picks_matching_track():
         ytdl.extract = fake_extract_junk
         url = asyncio.run(sources.soundcloud_alternative("Mick Gordon", "Doom 2016: Menu theme", 240))
         assert url is None, url        # лучше не сыграть, чем включить другую песню
+
+        async def fake_extract_preview(target, *, flat=False, timeout=60):
+            return {"entries": [
+                {"url": "sc/preview", "title": "Bones", "duration": 30.0, "uploader": "Imagine Dragons"},
+                {"url": "sc/full", "title": "Imagine Dragons - Bones", "duration": 165,
+                 "uploader": "fan"},
+            ]}
+        ytdl.extract = fake_extract_preview
+        urls = asyncio.run(sources.soundcloud_alternatives("Imagine Dragons", "Bones", 165))
+        assert urls == ["sc/full"], urls   # 30-секундный отрывок Go+ пропущен
+        assert "preview" in ytdl.format_for("https://api.soundcloud.com/tracks/1")
+        assert ytdl.format_for("https://youtu.be/x") == "bestaudio/best"
     finally:
         ytdl.extract = real
 
@@ -527,11 +539,16 @@ async def test_page_reload_retries_with_alt_clients():
     ytdl._download_once, orig_diag = always_reload, ytdl._log_diagnosis
     ytdl._log_diagnosis = fake_diag
     try:
-        ytdl._preferred = 0
+        ytdl._preferred, ytdl._all_failed_at = 0, 0.0
         assert not await ytdl.download(url, "/tmp/x", 5)
         assert len(seen) == len(ytdl.ATTEMPTS) and diag == [url]
         music = [t for t, e in seen if "web_music" in " ".join(e)]
         assert music == ["https://music.youtube.com/watch?v=V2SVRJ6dcE4"]
+        assert any("--no-cookies" in e for t, e in seen)
+        seen.clear()                                      # пауза: дальше только один способ
+        assert not await ytdl.download(url, "/tmp/x", 5)
+        assert len(seen) == 1 and diag == [url]
+        ytdl._all_failed_at = 0.0
     finally:
         ytdl._download_once, ytdl._log_diagnosis, ytdl._preferred = orig, orig_diag, orig_pref
 

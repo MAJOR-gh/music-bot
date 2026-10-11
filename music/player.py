@@ -190,8 +190,8 @@ class MusicPlayer:
                 artist, title = track.match
             else:
                 artist, title = sources.split_artist_title(track.title, track.uploader)
-            alt = await sources.soundcloud_alternative(artist, title, track.duration)
-            if alt:
+            alts = await sources.soundcloud_alternatives(artist, title, track.duration)
+            for alt in alts[:3]:
                 logger.info("[prepare] YouTube не отдал %r — играю с SoundCloud", track.title)
                 path = MusicPlayer._tmp_path()
                 if await ytdl.download(alt, path, timeout):
