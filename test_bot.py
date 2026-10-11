@@ -473,49 +473,64 @@ async def test_play_autocomplete():
 
 
 async def test_page_reload_retries_with_alt_clients():
-    """«The page needs to be reloaded»: повтор, затем запасные player_client."""
+    """Плавающие отказы YouTube: перебор клиентов, YT Music, запоминание сработавшего."""
+    url = "https://www.youtube.com/watch?v=V2SVRJ6dcE4"
     seen = []
 
-    async def fake_once(url, path, timeout, extra):
-        seen.append(extra)
-        if len(seen) < 3:
+    async def fake_once(target, path, timeout, extra):
+        seen.append((target, extra))
+        if len(seen) == 1:
             return False, "ERROR: [youtube] x: The page needs to be reloaded."
+        if len(seen) == 2:
+            return False, "ERROR: [youtube] x: Requested format is not available."
         return True, None
 
-    orig = ytdl._download_once
+    orig, orig_pref = ytdl._download_once, ytdl._preferred
     ytdl._download_once = fake_once
     try:
-        assert await ytdl.download("https://www.youtube.com/watch?v=x", "/tmp/x", 5)
-        assert seen[0] == [] and seen[1] == []
-        assert seen[2][0] == "--extractor-args" and "web_safari" in seen[2][1]
-        # Другая ошибка — без повторов.
+        ytdl._preferred = 0
+        assert await ytdl.download(url, "/tmp/x", 5)
+        assert seen[0] == (url, [])
+        assert seen[1] == ("https://music.youtube.com/watch?v=V2SVRJ6dcE4", [])
+        assert seen[2][1] == ["--extractor-args", "youtube:player_client=tv"]
+        assert ytdl._preferred == 2                       # запомнил tv
+        seen.clear()
+        seen.append(None); seen.append(None)              # следующие вызовы — сразу успех
+        assert await ytdl.download(url, "/tmp/x", 5)
+        assert seen[2][1] == ["--extractor-args", "youtube:player_client=tv"]
+
         seen.clear()
 
-        async def other(url, path, timeout, extra):
-            seen.append(extra)
+        async def other(target, path, timeout, extra):
+            seen.append(target)
             return False, "ERROR: Video unavailable"
         ytdl._download_once = other
-        assert not await ytdl.download("https://www.youtube.com/watch?v=x", "/tmp/x", 5)
-        assert len(seen) == 1
+        assert not await ytdl.download(url, "/tmp/x", 5)
+        assert len(seen) == 1                             # другая ошибка — без перебора
+        seen.clear()
+        assert not await ytdl.download("https://soundcloud.com/a/b", "/tmp/x", 5)
+        assert seen == ["https://soundcloud.com/a/b"]
     finally:
-        ytdl._download_once = orig
+        ytdl._download_once, ytdl._preferred = orig, orig_pref
 
     calls = []
 
     async def fake_run_once(args, timeout):
         calls.append(args)
-        if len(calls) < 3:
+        if len(calls) < 2:
             raise ytdl.YtdlError("ERROR: The page needs to be reloaded.")
         return b"{}"
 
     orig_run = ytdl._run_once
     ytdl._run_once = fake_run_once
     try:
-        assert await ytdl.extract("https://www.youtube.com/watch?v=x") == {}
-        assert calls[-1][-1] == "https://www.youtube.com/watch?v=x"
-        assert "--extractor-args" in calls[-1] and "--extractor-args" not in calls[0]
+        ytdl._preferred = 0
+        assert await ytdl.extract(url) == {}
+        assert calls[-1][-1] == "https://music.youtube.com/watch?v=V2SVRJ6dcE4"
+        assert ytdl._youtube_id("https://youtu.be/V2SVRJ6dcE4") == "V2SVRJ6dcE4"
+        assert ytdl._youtube_id("ytsearch1:bfg") is None
     finally:
-        ytdl._run_once = orig_run
+        ytdl._run_once, ytdl._preferred = orig_run, orig_pref
 
 ASYNC_TESTS = [
     test_plays_queue_in_order,

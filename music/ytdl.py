@@ -12,9 +12,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 import config
 
@@ -27,29 +29,64 @@ class YtdlError(Exception):
     pass
 
 
-# ── «The page needs to be reloaded» ──────────────────────────────────────────
-# YouTube периодически отвечает так залогиненным (с куками) клиентам yt-dlp
-# (yt-dlp#17405, #17389). Ошибка плавающая: помогает повтор, а если нет —
-# другие player_client. Их включаем только после такой ошибки: клиенты по
-# умолчанию отдают лучший звук (Opus), а web_safari — чаще AAC через HLS.
-RELOAD_MARKER = "page needs to be reloaded"
-ALT_EXTRACTOR_ARGS = os.getenv(
-    "YTDLP_ALT_EXTRACTOR_ARGS",
-    "youtube:player_client=web_safari,web_embedded,-tv_downgraded").strip()
+# ── Плавающие отказы YouTube для клиентов с куками ────────────────────────────
+# «The page needs to be reloaded» (yt-dlp#17405) и «Requested format is not
+# available» зависят от player_client. Перебираем способы по очереди и
+# запоминаем сработавший — следующие треки сразу идут через него.
+RETRY_MARKERS = ("page needs to be reloaded", "requested format is not available")
 # Ручная настройка клиентов для всех запросов (по умолчанию пусто — как yt-dlp).
 EXTRACTOR_ARGS = os.getenv("YTDLP_EXTRACTOR_ARGS", "").strip()
 
 
-def _is_reload(message: str) -> bool:
-    return RELOAD_MARKER in message.lower()
+@dataclass(frozen=True, slots=True)
+class Attempt:
+    name: str
+    extra: tuple[str, ...] = ()
+    music: bool = False          # открыть ролик как music.youtube.com
 
 
-def _attempts() -> list[list[str]]:
-    """Наборы доп. флагов для попыток: как есть, ещё раз, запасные клиенты."""
-    tries = [[], []]
-    if ALT_EXTRACTOR_ARGS:
-        tries.append(["--extractor-args", ALT_EXTRACTOR_ARGS])
-    return tries
+ATTEMPTS: tuple[Attempt, ...] = (
+    Attempt("клиенты по умолчанию"),
+    Attempt("YouTube Music", music=True),
+    Attempt("клиент tv", ("--extractor-args", "youtube:player_client=tv")),
+    Attempt("клиенты web_safari/web_embedded",
+            ("--extractor-args", "youtube:player_client=web_safari,web_embedded,-tv_downgraded")),
+)
+_preferred = 0   # индекс способа, сработавшего последним
+
+
+_YT_ID_RE = re.compile(r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)([\w-]{11})")
+
+
+def _youtube_id(url: str) -> str | None:
+    m = _YT_ID_RE.search(url or "")
+    return m.group(1) if m and "music.youtube.com" not in url else None
+
+
+def _should_retry(message: str | None) -> bool:
+    low = (message or "").lower()
+    return any(m in low for m in RETRY_MARKERS)
+
+
+def _plan(url: str) -> list[tuple[int, list[str], str]]:
+    """(индекс, доп. флаги, ссылка) — начиная со сработавшего в прошлый раз."""
+    vid = _youtube_id(url)
+    if vid is None:                       # не YouTube (SoundCloud и т. п.) — одна попытка
+        return [(0, [], url)]
+    order = [_preferred] + [i for i in range(len(ATTEMPTS)) if i != _preferred]
+    plan = []
+    for i in order:
+        att = ATTEMPTS[i]
+        target = f"https://music.youtube.com/watch?v={vid}" if att.music else url
+        plan.append((i, list(att.extra), target))
+    return plan
+
+
+def _remember(i: int) -> None:
+    global _preferred
+    if i != _preferred:
+        logger.info("[youtube] дальше качаю через: %s", ATTEMPTS[i].name)
+        _preferred = i
 
 
 def base_args() -> list[str]:
@@ -126,16 +163,18 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
 
 
 async def _run(args: list[str], timeout: float) -> bytes:
-    """Запуск yt-dlp; на «page needs to be reloaded» — повтор и запасные клиенты."""
-    tries = _attempts()
-    for i, extra in enumerate(tries):
+    """Запуск yt-dlp (последний аргумент — ссылка); на плавающих отказах YouTube — другие клиенты."""
+    plan = _plan(args[-1])
+    for n, (i, extra, target) in enumerate(plan):
         try:
-            return await _run_once(args[:-1] + extra + args[-1:], timeout)
+            out = await _run_once(args[:-1] + extra + [target], timeout)
+            if len(plan) > 1:
+                _remember(i)
+            return out
         except YtdlError as e:
-            if not _is_reload(str(e)) or i == len(tries) - 1:
+            if not _should_retry(str(e)) or n == len(plan) - 1:
                 raise
-            logger.info("[youtube] «page needs to be reloaded» — попытка %d/%d%s",
-                        i + 2, len(tries), " (запасные клиенты)" if tries[i + 1] else "")
+            logger.info("[youtube] %s — пробую: %s", str(e)[-80:], ATTEMPTS[plan[n + 1][0]].name)
     raise AssertionError("unreachable")
 
 
@@ -195,17 +234,18 @@ async def download(url: str, path: str, timeout: float = 300) -> bool:
     """Скачать звук целиком в файл. True — получилось и файл не пустой.
 
     При любой неудаче и при отмене (трек убрали из очереди) файл удаляется.
-    На «page needs to be reloaded» — повтор и запасные клиенты YouTube.
+    На плавающих отказах YouTube перебирает клиенты (см. ATTEMPTS).
     """
-    tries = _attempts()
-    for i, extra in enumerate(tries):
-        ok, message = await _download_once(url, path, timeout, extra)
+    plan = _plan(url)
+    for n, (i, extra, target) in enumerate(plan):
+        ok, message = await _download_once(target, path, timeout, extra)
         if ok:
+            if len(plan) > 1:
+                _remember(i)
             return True
-        if not message or not _is_reload(message) or i == len(tries) - 1:
+        if not _should_retry(message) or n == len(plan) - 1:
             return False
-        logger.info("[download] «page needs to be reloaded» — попытка %d/%d%s",
-                    i + 2, len(tries), " (запасные клиенты)" if tries[i + 1] else "")
+        logger.info("[download] пробую: %s", ATTEMPTS[plan[n + 1][0]].name)
     return False
 
 
