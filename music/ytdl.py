@@ -27,6 +27,31 @@ class YtdlError(Exception):
     pass
 
 
+# ── «The page needs to be reloaded» ──────────────────────────────────────────
+# YouTube периодически отвечает так залогиненным (с куками) клиентам yt-dlp
+# (yt-dlp#17405, #17389). Ошибка плавающая: помогает повтор, а если нет —
+# другие player_client. Их включаем только после такой ошибки: клиенты по
+# умолчанию отдают лучший звук (Opus), а web_safari — чаще AAC через HLS.
+RELOAD_MARKER = "page needs to be reloaded"
+ALT_EXTRACTOR_ARGS = os.getenv(
+    "YTDLP_ALT_EXTRACTOR_ARGS",
+    "youtube:player_client=web_safari,web_embedded,-tv_downgraded").strip()
+# Ручная настройка клиентов для всех запросов (по умолчанию пусто — как yt-dlp).
+EXTRACTOR_ARGS = os.getenv("YTDLP_EXTRACTOR_ARGS", "").strip()
+
+
+def _is_reload(message: str) -> bool:
+    return RELOAD_MARKER in message.lower()
+
+
+def _attempts() -> list[list[str]]:
+    """Наборы доп. флагов для попыток: как есть, ещё раз, запасные клиенты."""
+    tries = [[], []]
+    if ALT_EXTRACTOR_ARGS:
+        tries.append(["--extractor-args", ALT_EXTRACTOR_ARGS])
+    return tries
+
+
 def base_args() -> list[str]:
     """Общие флаги: JS-рантайм для обхода защиты YouTube, куки, IPv4."""
     args = [
@@ -42,6 +67,8 @@ def base_args() -> list[str]:
         args += ["--cookies", config.YTDLP_COOKIES]
     elif config.YTDLP_COOKIES_FROM_BROWSER:
         args += ["--cookies-from-browser", config.YTDLP_COOKIES_FROM_BROWSER]
+    if EXTRACTOR_ARGS:
+        args += ["--extractor-args", EXTRACTOR_ARGS]
     return args
 
 
@@ -99,6 +126,20 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
 
 
 async def _run(args: list[str], timeout: float) -> bytes:
+    """Запуск yt-dlp; на «page needs to be reloaded» — повтор и запасные клиенты."""
+    tries = _attempts()
+    for i, extra in enumerate(tries):
+        try:
+            return await _run_once(args[:-1] + extra + args[-1:], timeout)
+        except YtdlError as e:
+            if not _is_reload(str(e)) or i == len(tries) - 1:
+                raise
+            logger.info("[youtube] «page needs to be reloaded» — попытка %d/%d%s",
+                        i + 2, len(tries), " (запасные клиенты)" if tries[i + 1] else "")
+    raise AssertionError("unreachable")
+
+
+async def _run_once(args: list[str], timeout: float) -> bytes:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_ENV,
     )
@@ -154,12 +195,30 @@ async def download(url: str, path: str, timeout: float = 300) -> bool:
     """Скачать звук целиком в файл. True — получилось и файл не пустой.
 
     При любой неудаче и при отмене (трек убрали из очереди) файл удаляется.
+    На «page needs to be reloaded» — повтор и запасные клиенты YouTube.
     """
+    tries = _attempts()
+    for i, extra in enumerate(tries):
+        ok, message = await _download_once(url, path, timeout, extra)
+        if ok:
+            return True
+        if not message or not _is_reload(message) or i == len(tries) - 1:
+            return False
+        logger.info("[download] «page needs to be reloaded» — попытка %d/%d%s",
+                    i + 2, len(tries), " (запасные клиенты)" if tries[i + 1] else "")
+    return False
+
+
+async def _download_once(url: str, path: str, timeout: float,
+                         extra: list[str]) -> tuple[bool, str | None]:
     ok = False
+    message = None
+    cmd = download_cmd(url)
+    cmd = cmd[:-1] + extra + cmd[-1:]
     try:
         with open(path, "wb") as f:
             proc = await asyncio.create_subprocess_exec(
-                *download_cmd(url), stdout=f, stderr=asyncio.subprocess.PIPE, env=_ENV,
+                *cmd, stdout=f, stderr=asyncio.subprocess.PIPE, env=_ENV,
             )
             try:
                 _, err = await asyncio.wait_for(proc.communicate(), timeout)
@@ -178,7 +237,7 @@ async def download(url: str, path: str, timeout: float = 300) -> bool:
     finally:
         if not ok:
             remove_file(path)
-    return ok
+    return ok, message
 
 
 def spawn_pipe(url: str) -> subprocess.Popen:
