@@ -47,6 +47,19 @@ class Track:
         return format_duration(self.duration, self.live)
 
     @property
+    def duration_tag(self) -> str:
+        """« `[3:45]`» для сообщений; пусто, если длительность неизвестна (не «?:??»)."""
+        return f" `[{self.duration_str}]`" if self.duration or self.live else ""
+
+    @property
+    def display_title(self) -> str:
+        """Название для чата: у треков из Spotify/Last.fm добавляем исполнителя."""
+        if self.uploader and self.source in ("Spotify", "Last.fm") \
+                and self.uploader.lower() not in (self.title or "").lower():
+            return f"{self.uploader} — {self.title}"
+        return self.title
+
+    @property
     def link_title(self) -> str:
         """Название ссылкой (если ссылка уже известна) — для эмбедов."""
         title = short_title(self.title, 200)

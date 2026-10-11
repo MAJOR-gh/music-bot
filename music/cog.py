@@ -38,10 +38,11 @@ def suggestion_label(r: SearchResult) -> str:
 
 
 def suggestion_value(r: SearchResult) -> str:
-    """Что вернёт Discord при выборе подсказки (≤100 символов): ссылка или «lastfm:…»."""
+    """Что вернёт Discord при выборе подсказки (≤100 символов): ссылка или «spotify:…»."""
     if r.url and len(r.url) <= 100:
         return r.url
-    return ("lastfm:" + f"{r.uploader or ''} - {r.title}".strip(" -"))[:100]
+    prefix = sources.normalize_source(r.source) if r.source else "track"
+    return (f"{prefix}:" + f"{r.uploader or ''} - {r.title}".strip(" -"))[:100]
 
 
 SOURCE_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in sources.SOURCES.items()]
@@ -243,7 +244,7 @@ class MusicCog(commands.Cog):
 
         upcoming = state.upcoming[:5]
         if upcoming:
-            lines = [f"`{i}.` {short_title(t.title)} `[{t.duration_str}]`"
+            lines = [f"`{i}.` {short_title(t.display_title)}{t.duration_tag}"
                      for i, t in enumerate(upcoming, start=1)]
             embed.add_field(name="📋 Далее в очереди", value=_field(lines, len(state)), inline=False)
         if state.repeat is not RepeatMode.OFF:
@@ -347,9 +348,26 @@ class MusicCog(commands.Cog):
 
     @staticmethod
     def enqueue_message(was_idle: bool, track: Track) -> str:
-        if was_idle:
-            return f"▶️ Запускаю: **{short_title(track.title, 100)}** `[{track.duration_str}]`"
-        return f"➕ В очередь: **{short_title(track.title, 100)}** `[{track.duration_str}]`"
+        head = "▶️ Запускаю" if was_idle else "➕ В очередь"
+        return f"{head}: **{short_title(track.display_title, 100)}**{track.duration_tag}"
+
+    async def _resolve(self, interaction: discord.Interaction, track: Track) -> bool:
+        """Трек из Spotify/Last.fm → сразу найти его на YouTube Music.
+
+        Так в чате видна настоящая длительность, а если трека нет — пишем об этом
+        сразу, а не молча пропускаем его в очереди.
+        """
+        if track.webpage_url or not track.match:
+            return True
+        try:
+            ok = await asyncio.wait_for(MusicPlayer._fill_from_match(track), 10)
+        except Exception as e:  # noqa: BLE001 — не успели: найдёт плеер перед игрой
+            logger.info("[play] YT Music не ответил вовремя для %r: %s", track.title, e)
+            return True
+        if not ok:
+            await interaction.followup.send(
+                f"❌ Не нашёл на YouTube Music: **{short_title(track.display_title, 100)}**")
+        return ok
 
     async def _track_from_url(self, url: str, requester: str) -> Track | None:
         """Ссылка YouTube/SoundCloud/… → Track с названием и длительностью."""
@@ -415,15 +433,14 @@ class MusicCog(commands.Cog):
             cache[key] = cache.pop(key)  # LRU: свежий — в конец
             return cache[key]
         if source == "lastfm":
-            results = await asyncio.wait_for(
-                sources.search_lastfm(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
-            for r in results:
-                # У Last.fm нет ссылки на звук — в value кладём «lastfm:…», а сам
-                # трек плеер найдёт на YouTube Music перед игрой.
-                r.url = None
+            search = sources.search_lastfm
+        elif source == "spotify":
+            search = sources.search_spotify
         else:
-            results = await asyncio.wait_for(
-                sources.search_ytmusic(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
+            search = sources.search_ytmusic
+        # У Spotify/Last.fm нет ссылки на звук: в value уйдёт «spotify:…»/«lastfm:…»,
+        # а сам трек плеер найдёт на YouTube Music перед игрой.
+        results = await asyncio.wait_for(search(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
         cache[key] = results
         for r in results:
             self._ac_results[suggestion_value(r)] = r
@@ -435,11 +452,17 @@ class MusicCog(commands.Cog):
 
     @staticmethod
     def _suggest_source(interaction: discord.Interaction) -> str:
-        """Откуда подсказки: Last.fm, если он выбран (или стоит по умолчанию) и настроен."""
+        """Откуда подсказки: source (или DEFAULT_SEARCH) без учёта регистра.
+
+        Spotify/Last.fm — у них (если заданы ключи), иначе — YouTube Music:
+        поиск самого YouTube через yt-dlp не успевает в 3 секунды автокомплита.
+        """
         ns = getattr(interaction, "namespace", None)
-        chosen = getattr(ns, "source", None) or config.DEFAULT_SEARCH
+        chosen = sources.normalize_source(getattr(ns, "source", None) or config.DEFAULT_SEARCH)
         if chosen == "lastfm" and config.LASTFM_API_KEY:
             return "lastfm"
+        if chosen == "spotify" and config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET:
+            return "spotify"
         return "ytmusic"
 
     async def play_autocomplete(
@@ -507,6 +530,8 @@ class MusicCog(commands.Cog):
         picked = self._ac_results.get(query)
         if picked is not None:
             track = picked.to_track(requester)
+            if not await self._resolve(interaction, track):
+                return
             was_idle = await self.enqueue(interaction, [track])
             if was_idle is not None:
                 await interaction.followup.send(self.enqueue_message(was_idle, track))
@@ -523,9 +548,7 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(self.enqueue_message(was_idle, track))
             return
 
-        key = source.value if source else config.DEFAULT_SEARCH
-        if key not in sources.SOURCES:
-            key = "youtube"
+        key = sources.normalize_source(source.value if source else config.DEFAULT_SEARCH)
         label = sources.SOURCES[key]
         try:
             results = await sources.search(key, query, 1)
@@ -550,6 +573,8 @@ class MusicCog(commands.Cog):
             return
 
         track = results[0].to_track(requester)
+        if not await self._resolve(interaction, track):
+            return
         was_idle = await self.enqueue(interaction, [track])
         if was_idle is not None:
             await interaction.followup.send(self.enqueue_message(was_idle, track))
@@ -616,13 +641,13 @@ class MusicCog(commands.Cog):
         if state.current:
             embed.add_field(
                 name="Сейчас играет",
-                value=f"**{short_title(state.current.title, 200)}** `[{state.current.duration_str}]`",
+                value=f"**{short_title(state.current.display_title, 200)}**{state.current.duration_tag}",
                 inline=False,
             )
         upcoming = state.upcoming[:10]
         if upcoming:
             lines = [
-                f"`{i}.` {short_title(t.title)} `[{t.duration_str}]` — {short_title(t.requested_by, 32)}"
+                f"`{i}.` {short_title(t.display_title)}{t.duration_tag} — {short_title(t.requested_by, 32)}"
                 for i, t in enumerate(upcoming, start=1)
             ]
             embed.add_field(name="Далее", value=_field(lines, len(state)), inline=False)

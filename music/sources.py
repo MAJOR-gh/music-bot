@@ -34,6 +34,22 @@ SOURCES = {
 }
 
 
+_SOURCE_ALIASES = {
+    "spotify": "spotify", "sp": "spotify",
+    "lastfm": "lastfm", "last": "lastfm", "lfm": "lastfm",
+    "ytmusic": "ytmusic", "youtubemusic": "ytmusic", "ytm": "ytmusic", "music": "ytmusic",
+}
+
+
+def normalize_source(value: str | None) -> str:
+    """Источник поиска без учёта регистра и знаков: «Last.FM», «last fm», «LASTFM» → lastfm.
+
+    Spotify и Last.fm — ищем у них, YouTube Music — в нём, всё остальное — YouTube.
+    """
+    key = re.sub(r"[\s._\-]+", "", (value or "").lower())
+    return _SOURCE_ALIASES.get(key, "youtube")
+
+
 class SourceNotConfigured(Exception):
     """Для источника не заданы ключи в .env — текст исключения объясняет, что вписать."""
 
@@ -326,7 +342,8 @@ async def search_lastfm(query: str, limit: int) -> list[SearchResult]:
 
 
 async def search(source: str, query: str, limit: int) -> list[SearchResult]:
-    """Поиск по выбранному источнику (ключ из SOURCES)."""
+    """Поиск по выбранному источнику (регистр и написание не важны, см. normalize_source)."""
+    source = normalize_source(source)
     if source == "ytmusic":
         return await search_ytmusic(query, limit)
     if source == "spotify":
