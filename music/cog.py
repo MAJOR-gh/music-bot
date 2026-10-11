@@ -17,10 +17,25 @@ from . import player as player_module
 from . import sources, updater, ytdl
 from .player import MusicPlayer
 from .queue import GuildMusicState, RepeatMode
-from .track import Track, short_title
-from .ui import PlayerView, SearchView
+from .track import SearchResult, Track, short_title
+from .ui import PlayerView
 
 logger = logging.getLogger("music_bot.cog")
+
+# Discord показывает максимум 25 вариантов автокомплита.
+AUTOCOMPLETE_LIMIT = 25
+
+
+def suggestion_label(r: SearchResult) -> str:
+    """«Название - Исполнитель (3:45)», не длиннее 100 символов (лимит Discord)."""
+    tail = f" ({r.duration_str})" if r.duration else ""
+    head = r.title or "Unknown"
+    if r.uploader:
+        head = f"{head} - {r.uploader}"
+    if len(head) + len(tail) > 100:
+        head = head[:100 - len(tail) - 1].rstrip() + "…"
+    return head + tail
+
 
 SOURCE_CHOICES = [app_commands.Choice(name=label, value=key) for key, label in sources.SOURCES.items()]
 
@@ -69,6 +84,9 @@ class MusicCog(commands.Cog):
         self.idle_timeout = idle_timeout
         self._states: dict[int, GuildMusicState] = {}
         self._players: dict[int, MusicPlayer] = {}
+        # Автокомплит /play: запрос → результаты и ссылка → выбранный результат.
+        self._ac_cache: dict[str, list[SearchResult]] = {}
+        self._ac_results: dict[str, SearchResult] = {}
 
     # ── Вспомогательное ───────────────────────────────────────────────────
     def get_state(self, guild_id: int) -> GuildMusicState:
@@ -377,12 +395,53 @@ class MusicCog(commands.Cog):
         await self._disconnect(interaction.guild.id)
 
     # ── /play ─────────────────────────────────────────────────────────────
+    # ── Подсказки при вводе /play (как всплывающий список у Eara) ─────────
+    # Discord ждёт ответ на автокомплит ≤3 с и шлёт запрос на каждую букву,
+    # поэтому ищем в YouTube Music (быстро, без куки YouTube) и кэшируем.
+    _AC_TIMEOUT = 2.5
+    _AC_CACHE_MAX = 200
+
+    async def _suggest(self, query: str) -> list[SearchResult]:
+        key = " ".join(query.lower().split())
+        cache = self._ac_cache
+        if key in cache:
+            cache[key] = cache.pop(key)  # LRU: свежий — в конец
+            return cache[key]
+        results = await asyncio.wait_for(
+            sources.search_ytmusic(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
+        cache[key] = results
+        for r in results:
+            if r.url:
+                self._ac_results[r.url] = r
+        while len(cache) > self._AC_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        while len(self._ac_results) > self._AC_CACHE_MAX * 5:
+            self._ac_results.pop(next(iter(self._ac_results)))
+        return results
+
+    async def play_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        current = (current or "").strip()
+        if len(current) < 2 or _is_url(current):
+            return []
+        try:
+            results = await self._suggest(current)
+        except Exception as e:  # noqa: BLE001 — таймаут/ошибка: просто без подсказок
+            logger.debug("[autocomplete] %r: %s", current, e)
+            return []
+        return [
+            app_commands.Choice(name=suggestion_label(r), value=r.url)
+            for r in results if r.url and len(r.url) <= 100
+        ][:AUTOCOMPLETE_LIMIT]
+
     @app_commands.command(name="play", description="Воспроизвести трек по ссылке или поисковому запросу")
     @app_commands.describe(
         query="Ссылка (YouTube, SoundCloud, Spotify) или текст для поиска",
         source="Где искать текст (по умолчанию — YouTube)",
     )
     @app_commands.choices(source=SOURCE_CHOICES)
+    @app_commands.autocomplete(query=play_autocomplete)
     async def play(
         self, interaction: discord.Interaction, query: str,
         source: app_commands.Choice[str] | None = None,
@@ -421,7 +480,16 @@ class MusicCog(commands.Cog):
                 )
             return
 
-        # Ссылка → играем сразу. Текст → показываем выбор из нескольких вариантов.
+        # Выбран вариант из подсказок → метаданные уже есть, yt-dlp не нужен.
+        picked = self._ac_results.get(query)
+        if picked is not None:
+            track = picked.to_track(requester)
+            was_idle = await self.enqueue(interaction, [track])
+            if was_idle is not None:
+                await interaction.followup.send(self.enqueue_message(was_idle, track))
+            return
+
+        # Ссылка → играем сразу. Текст без выбора подсказки → первый результат.
         if _is_url(query):
             track = await self._track_from_url(query, requester)
             if track is None:
@@ -437,7 +505,7 @@ class MusicCog(commands.Cog):
             key = "youtube"
         label = sources.SOURCES[key]
         try:
-            results = await sources.search(key, query, config.SEARCH_RESULTS)
+            results = await sources.search(key, query, 1)
         except sources.SourceNotConfigured as e:
             await interaction.followup.send(f"⚙️ {e}")
             return
@@ -447,7 +515,7 @@ class MusicCog(commands.Cog):
             if key == "youtube":
                 # YouTube отшил поиск (бот-проверка и т.п.) — тот же запрос в YT Music.
                 try:
-                    results = await sources.search("ytmusic", query, config.SEARCH_RESULTS)
+                    results = await sources.search("ytmusic", query, 1)
                     label = f"{sources.SOURCES['ytmusic']} (YouTube не ответил)"
                 except Exception as e2:  # noqa: BLE001
                     logger.warning("[search] запасной YT Music %r: %s", query, e2)
@@ -458,13 +526,10 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(f"❌ Ничего не нашёл ({label}) по запросу: `{query}`")
             return
 
-        view = SearchView(
-            self, results, requester=requester, page_size=config.SEARCH_PAGE_SIZE,
-        )
-        view.message = await interaction.followup.send(
-            f"🔎 {label}: нашёл {len(results)} вариантов по запросу **{query[:100]}** — выбери нужный:",
-            view=view, wait=True,
-        )
+        track = results[0].to_track(requester)
+        was_idle = await self.enqueue(interaction, [track])
+        if was_idle is not None:
+            await interaction.followup.send(self.enqueue_message(was_idle, track))
 
     # ── /skip ─────────────────────────────────────────────────────────────
     @app_commands.command(name="skip", description="Пропустить текущий трек")
