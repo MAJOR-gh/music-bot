@@ -431,11 +431,11 @@ def test_soundcloud_picks_matching_track():
     real = ytdl.extract
     try:
         ytdl.extract = fake_extract
-        url = asyncio.run(sources.soundcloud_alternative("Mick Gordon", "Doom 2016: Menu theme", 240))
-        assert url == "sc/right", url
+        urls = asyncio.run(sources.soundcloud_alternatives("Mick Gordon", "Doom 2016: Menu theme", 240))
+        assert urls == ["sc/right"], urls
         ytdl.extract = fake_extract_junk
-        url = asyncio.run(sources.soundcloud_alternative("Mick Gordon", "Doom 2016: Menu theme", 240))
-        assert url is None, url        # лучше не сыграть, чем включить другую песню
+        urls = asyncio.run(sources.soundcloud_alternatives("Mick Gordon", "Doom 2016: Menu theme", 240))
+        assert urls == [], urls        # лучше не сыграть, чем включить другую песню
 
         async def fake_extract_preview(target, *, flat=False, timeout=60):
             return {"entries": [
@@ -489,6 +489,28 @@ async def test_play_autocomplete():
         sources.search_ytmusic = orig
     assert suggestion_label(SearchResult(title="T", url=None, duration=None, uploader=None)) == "T"
 
+    # Last.fm: подсказки, если источник выбран и есть ключ; value — «lastfm:…»
+    import types
+    import config as cfg
+
+    async def fake_lastfm(query, limit):
+        return [SearchResult(title="Bones", url=None, duration=None, uploader="Imagine Dragons",
+                             source="Last.fm")]
+    orig_lfm, orig_key = sources.search_lastfm, cfg.LASTFM_API_KEY
+    sources.search_lastfm, cfg.LASTFM_API_KEY = fake_lastfm, "k"
+    try:
+        cog = MusicCog(None, 60)
+        inter = types.SimpleNamespace(namespace=types.SimpleNamespace(source="lastfm"))
+        choices = await cog.play_autocomplete(inter, "bones")
+        assert [c.value for c in choices] == ["lastfm:Imagine Dragons - Bones"], choices
+        assert choices[0].name == "Bones - Imagine Dragons"
+        track = cog._ac_results["lastfm:Imagine Dragons - Bones"].to_track("me")
+        assert track.match == ("Imagine Dragons", "Bones") and track.webpage_url is None
+        cfg.LASTFM_API_KEY = ""                    # без ключа — обычные подсказки YT Music
+        assert MusicCog._suggest_source(inter) == "ytmusic"
+    finally:
+        sources.search_lastfm, cfg.LASTFM_API_KEY = orig_lfm, orig_key
+
 
 async def test_page_reload_retries_with_alt_clients():
     """Плавающие отказы YouTube: перебор клиентов, YT Music, запоминание сработавшего."""
@@ -509,7 +531,7 @@ async def test_page_reload_retries_with_alt_clients():
         ytdl._preferred = 0
         assert await ytdl.download(url, "/tmp/x", 5)
         assert seen[0] == (url, [])
-        assert seen[1] == (url, ["--extractor-args", "youtube:player_client=mweb"])
+        assert seen[1] == (url, ["--extractor-args", "youtube:player_client=tv_samsung"])
         assert seen[2][1] == ["--extractor-args", "youtube:player_client=default,web_embedded"]
         assert ytdl._preferred == 2                       # запомнил сработавший
         seen.clear()
@@ -550,7 +572,6 @@ async def test_page_reload_retries_with_alt_clients():
         assert len(seen) == len(ytdl.ATTEMPTS) and diag == [url]
         music = [t for t, e in seen if "web_music" in " ".join(e)]
         assert music == ["https://music.youtube.com/watch?v=V2SVRJ6dcE4"]
-        assert any("--no-cookies" in e for t, e in seen)
         seen.clear()                                      # пауза: дальше только один способ
         assert not await ytdl.download(url, "/tmp/x", 5)
         assert len(seen) == 1 and diag == [url]

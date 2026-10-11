@@ -22,11 +22,6 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # Автоотключение при бездействии (секунды). По умолчанию 5 минут.
 IDLE_TIMEOUT: int = int(os.getenv("IDLE_TIMEOUT", "300"))
 
-# Сколько вариантов показывать в выпадающем списке текстового поиска (/play <текст>).
-# Список перелистывается по SEARCH_PAGE_SIZE штук на страницу.
-SEARCH_RESULTS: int = max(1, int(os.getenv("SEARCH_RESULTS", "25")))
-SEARCH_PAGE_SIZE: int = 10  # пунктов на странице выпадашки (Discord max — 25)
-
 # Где по умолчанию искать текст из /play: youtube | ytmusic | spotify | lastfm.
 # (В самой команде источник можно выбрать параметром source.)
 DEFAULT_SEARCH: str = os.getenv("DEFAULT_SEARCH", "youtube").strip().lower() or "youtube"
@@ -38,6 +33,10 @@ SPOTIFY_CLIENT_SECRET: str = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 
 # Поиск по Last.fm — нужен API-ключ (бесплатно: last.fm/api/account/create).
 LASTFM_API_KEY: str = os.getenv("LASTFM_API_KEY", "").strip()
+
+# Если YouTube не отдал трек — искать ту же песню на SoundCloud (1 — да).
+# По умолчанию выключено: качество там ниже, а подсовывает он и перезаливы.
+SOUNDCLOUD_FALLBACK: bool = os.getenv("SOUNDCLOUD_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Сколько треков максимум брать из плейлиста/альбома Spotify за раз.
 MAX_PLAYLIST_TRACKS: int = max(1, int(os.getenv("MAX_PLAYLIST_TRACKS", "100")))

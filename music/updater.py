@@ -87,7 +87,7 @@ async def update_if_needed() -> None:
     )
     try:
         _, err = await asyncio.wait_for(proc.communicate(), 300)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         logger.warning("[update] pip не уложился в 5 минут")
         return

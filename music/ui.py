@@ -22,7 +22,7 @@ logger = logging.getLogger("music_bot.ui")
 class PlayerView(discord.ui.View):
     """Кнопки под эмбедом «сейчас играет». Привязаны к конкретному серверу."""
 
-    def __init__(self, cog: "MusicCog", guild_id: int):
+    def __init__(self, cog: MusicCog, guild_id: int):
         super().__init__(timeout=None)  # живёт пока висит панель
         self.cog = cog
         self.guild_id = guild_id
