@@ -17,7 +17,7 @@ from . import player as player_module
 from . import pot, sources, updater, ytdl
 from .player import MusicPlayer
 from .queue import GuildMusicState, RepeatMode
-from .track import SearchResult, Track, short_title
+from .track import SearchResult, Track, format_duration, parse_time, short_title
 from .ui import PlayerView
 
 logger = logging.getLogger("music_bot.cog")
@@ -219,8 +219,82 @@ class MusicCog(commands.Cog):
         vc.stop()
         return True
 
+    def go_back(self, guild: discord.Guild) -> bool:
+        """Предыдущий трек (кнопка ⏪, /back): он и текущий встают в начало очереди."""
+        state = self.get_state(guild.id)
+        history = state.history
+        # Последний в истории — обычно сам текущий трек (если он уже заиграл).
+        own = 1 if state.current is not None and history and history[-1] is state.current else 0
+        if len(history) <= own:
+            return False
+        if own:
+            history.pop()
+        prev = history.pop()
+        current = state.current
+        if current is not None:
+            state.add_front(current)
+        state.add_front(prev)
+        state.halted = False
+        if current is not None and self.skip(guild):
+            # skip() пометил трек «пропущенным»: повтор не вернёт его второй раз.
+            return True
+        self._wake(guild)
+        return True
+
+    def _wake(self, guild: discord.Guild) -> None:
+        """Плеер простаивает (или не запущен) — пусть возьмёт трек из очереди."""
+        state = self.get_state(guild.id)
+        if guild.voice_client is None:
+            return
+        self._start_player(guild)
+        if state.current is None:
+            state.next_event.set()
+
+    def position(self, guild_id: int) -> float | None:
+        player = self._players.get(guild_id)
+        return player.position if player is not None else None
+
+    def seek(self, guild: discord.Guild, seconds: float) -> str | None:
+        player = self._players.get(guild.id)
+        if player is None:
+            return "Сейчас ничего не играет."
+        return player.seek(seconds)
+
+    def set_autoplay(self, guild: discord.Guild, enabled: bool) -> None:
+        """Включить/выключить автоплей. Выключили — убрать подобранные им треки."""
+        state = self.get_state(guild.id)
+        state.autoplay = enabled
+        player = self._players.get(guild.id)
+        if enabled:
+            state.halted = False
+            if player is not None:
+                player._ap_failed = None
+                player.schedule_autoplay()
+            if state.current is None and state.is_empty and state.history:
+                self._wake(guild)         # очередь уже кончилась — сразу подобрать трек
+        else:
+            state.drop_autoplay()
+        if player is not None:
+            player.schedule_prefetch()
+
+    def queue_changed(self, guild: discord.Guild) -> None:
+        """Очередь переставили/почистили — обновить предзагрузку (и подбор автоплея)."""
+        player = self._players.get(guild.id)
+        if player is not None:
+            player.schedule_prefetch()
+            player.schedule_autoplay()
+
     # ── Живая панель-плеер ────────────────────────────────────────────────
-    def _now_embed(self, state: GuildMusicState) -> discord.Embed:
+    @staticmethod
+    def _footer(state: GuildMusicState) -> str | None:
+        parts = []
+        if state.repeat is not RepeatMode.OFF:
+            parts.append(f"{state.repeat.emoji} Повтор: {state.repeat.label}")
+        if state.autoplay:
+            parts.append("📻 Автоплей")
+        return " · ".join(parts) or None
+
+    def _now_embed(self, state: GuildMusicState, show_position: bool = False) -> discord.Embed:
         """Эмбед «сейчас играет» по текущему состоянию сервера."""
         track = state.current
         guild = self.bot.get_guild(state.guild_id)
@@ -233,7 +307,11 @@ class MusicCog(commands.Cog):
             description=f"**{track.link_title}**",
             color=0xED4245 if paused else 0x57F287,
         )
-        embed.add_field(name="Длительность", value=track.duration_str, inline=True)
+        length = track.duration_str
+        pos = self.position(state.guild_id) if show_position else None
+        if pos is not None and not track.live:
+            length = f"{format_duration(int(pos)) if pos >= 1 else '0:00'} / {length}"
+        embed.add_field(name="Длительность", value=length, inline=True)
         if track.uploader:
             embed.add_field(name="Автор", value=short_title(track.uploader, 100), inline=True)
         embed.add_field(name="Заказал", value=track.requested_by, inline=True)
@@ -247,8 +325,9 @@ class MusicCog(commands.Cog):
             lines = [f"`{i}.` {short_title(t.display_title)}{t.duration_tag}"
                      for i, t in enumerate(upcoming, start=1)]
             embed.add_field(name="📋 Далее в очереди", value=_field(lines, len(state)), inline=False)
-        if state.repeat is not RepeatMode.OFF:
-            embed.set_footer(text=f"{state.repeat.emoji} Повтор: {state.repeat.label}")
+        footer = self._footer(state)
+        if footer:
+            embed.set_footer(text=footer)
         return embed
 
     async def _remove_panel(self, state: GuildMusicState) -> None:
@@ -651,8 +730,9 @@ class MusicCog(commands.Cog):
                 for i, t in enumerate(upcoming, start=1)
             ]
             embed.add_field(name="Далее", value=_field(lines, len(state)), inline=False)
-        if state.repeat is not RepeatMode.OFF:
-            embed.set_footer(text=f"{state.repeat.emoji} Повтор: {state.repeat.label}")
+        footer = self._footer(state)
+        if footer:
+            embed.set_footer(text=footer)
         await interaction.response.send_message(embed=embed)
 
     # ── /nowplaying ───────────────────────────────────────────────────────
@@ -664,7 +744,7 @@ class MusicCog(commands.Cog):
                 "❌ Сейчас ничего не играет.", ephemeral=True
             )
             return
-        await interaction.response.send_message(embed=self._now_embed(state))
+        await interaction.response.send_message(embed=self._now_embed(state, show_position=True))
 
     # ── /repeat ───────────────────────────────────────────────────────────
     @app_commands.command(name="repeat", description="Повтор: выкл / один трек / вся очередь")
@@ -686,6 +766,148 @@ class MusicCog(commands.Cog):
             new = state.repeat
         await interaction.response.send_message(f"{new.emoji} Повтор: **{new.label}**.")
         await self._rerender_panel(state)        # обновить футер и кнопку 🔁 на панели
+
+    # ── /back ─────────────────────────────────────────────────────────────
+    @app_commands.command(name="back", description="Предыдущий трек")
+    async def back(self, interaction: discord.Interaction):
+        if interaction.guild.voice_client is None:
+            await interaction.response.send_message("❌ Я не в голосовом канале.", ephemeral=True)
+            return
+        if not self.go_back(interaction.guild):
+            await interaction.response.send_message("❌ Раньше ничего не играло.", ephemeral=True)
+            return
+        await interaction.response.send_message("⏪ Возвращаю предыдущий трек.")
+
+    # ── Перемотка: /seek, /forward, /rewind ───────────────────────────────
+    async def _seek_reply(self, interaction: discord.Interaction, target: float) -> None:
+        state = self.get_state(interaction.guild.id)
+        error = self.seek(interaction.guild, target)
+        if error:
+            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            return
+        total = state.current.duration_str if state.current else "?:??"
+        shown = format_duration(int(target)) if target >= 1 else "0:00"
+        await interaction.response.send_message(f"⏩ Перемотал на **{shown}** / {total}.")
+
+    @app_commands.command(name="seek", description="Перемотать на время: 90, 2:30 или 1:02:03")
+    @app_commands.describe(position="Куда перемотать: секунды (90), минуты:секунды (2:30) или ч:мм:сс")
+    async def seek_cmd(self, interaction: discord.Interaction, position: str):
+        target = parse_time(position)
+        if target is None:
+            await interaction.response.send_message(
+                "❌ Не понял время. Примеры: `90`, `2:30`, `1:02:03`.", ephemeral=True)
+            return
+        await self._seek_reply(interaction, target)
+
+    async def _seek_relative(self, interaction: discord.Interaction, amount: str | None,
+                             sign: int) -> None:
+        delta = parse_time(amount) if amount else 10
+        if delta is None:
+            await interaction.response.send_message(
+                "❌ Не понял время. Примеры: `10`, `30`, `1:00`.", ephemeral=True)
+            return
+        pos = self.position(interaction.guild.id)
+        if pos is None:
+            await interaction.response.send_message("❌ Сейчас ничего не играет.", ephemeral=True)
+            return
+        await self._seek_reply(interaction, max(0.0, pos + sign * delta))
+
+    @app_commands.command(name="forward", description="Вперёд на N секунд (по умолчанию 10)")
+    @app_commands.describe(amount="На сколько: секунды (30) или минуты:секунды (1:00)")
+    async def forward(self, interaction: discord.Interaction, amount: str | None = None):
+        await self._seek_relative(interaction, amount, +1)
+
+    @app_commands.command(name="rewind", description="Назад на N секунд (по умолчанию 10)")
+    @app_commands.describe(amount="На сколько: секунды (30) или минуты:секунды (1:00)")
+    async def rewind(self, interaction: discord.Interaction, amount: str | None = None):
+        await self._seek_relative(interaction, amount, -1)
+
+    # ── Управление очередью ───────────────────────────────────────────────
+    async def _queue_reply(self, interaction: discord.Interaction, text: str) -> None:
+        self.queue_changed(interaction.guild)
+        await interaction.response.send_message(text)
+        await self._rerender_panel(self.get_state(interaction.guild.id))
+
+    async def _no_track(self, interaction: discord.Interaction, number: int) -> None:
+        size = len(self.get_state(interaction.guild.id))
+        text = "📭 Очередь пуста." if not size else f"❌ Нет трека №{number} — в очереди {size}."
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @app_commands.command(name="shuffle", description="Перемешать очередь")
+    async def shuffle(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild.id)
+        if len(state) < 2:
+            await interaction.response.send_message(
+                "❌ Перемешивать нечего — в очереди меньше двух треков.", ephemeral=True)
+            return
+        count = state.shuffle()
+        await self._queue_reply(interaction, f"🔀 Перемешал очередь ({count} треков).")
+
+    @app_commands.command(name="remove", description="Убрать трек из очереди по номеру")
+    @app_commands.describe(number="Номер трека в /queue")
+    async def remove(self, interaction: discord.Interaction, number: app_commands.Range[int, 1]):
+        track = self.get_state(interaction.guild.id).remove(number)
+        if track is None:
+            await self._no_track(interaction, number)
+            return
+        await self._queue_reply(
+            interaction, f"🗑️ Убрал из очереди: **{short_title(track.display_title, 100)}**")
+
+    @app_commands.command(name="move", description="Переставить трек в очереди")
+    @app_commands.rename(src="from", dst="to")
+    @app_commands.describe(src="Какой номер переставить", dst="На какое место")
+    async def move(self, interaction: discord.Interaction,
+                   src: app_commands.Range[int, 1], dst: app_commands.Range[int, 1]):
+        state = self.get_state(interaction.guild.id)
+        track = state.move(src, dst)
+        if track is None:
+            await self._no_track(interaction, src)
+            return
+        place = state.upcoming.index(track) + 1
+        await self._queue_reply(
+            interaction, f"↕️ **{short_title(track.display_title, 100)}** теперь №{place}.")
+
+    @app_commands.command(name="skipto", description="Перейти к треку из очереди по номеру")
+    @app_commands.describe(number="Номер трека в /queue")
+    async def skipto(self, interaction: discord.Interaction, number: app_commands.Range[int, 1]):
+        state = self.get_state(interaction.guild.id)
+        track = state.skip_to(number)
+        if track is None:
+            await self._no_track(interaction, number)
+            return
+        if not self.skip(interaction.guild):
+            self._wake(interaction.guild)
+        self.queue_changed(interaction.guild)
+        await interaction.response.send_message(
+            f"⏭️ Перехожу к **{short_title(track.display_title, 100)}**.")
+
+    @app_commands.command(name="clear", description="Очистить очередь (текущий трек доиграет)")
+    async def clear(self, interaction: discord.Interaction):
+        state = self.get_state(interaction.guild.id)
+        if state.is_empty:
+            await interaction.response.send_message("📭 Очередь и так пуста.", ephemeral=True)
+            return
+        count = len(state)
+        state.clear()
+        await self._queue_reply(interaction, f"🧹 Очередь очищена ({count} треков).")
+
+    # ── /autoplay ─────────────────────────────────────────────────────────
+    @staticmethod
+    def autoplay_text(enabled: bool) -> str:
+        if not enabled:
+            return "📻 Автоплей **выключен**."
+        how = "Last.fm" if config.LASTFM_API_KEY else "радио YouTube Music"
+        return (f"📻 Автоплей **включён**: когда очередь кончится, включу похожие треки "
+                f"(подбирает {how}).")
+
+    @app_commands.command(name="autoplay", description="Автоплей: похожие треки, когда очередь кончилась")
+    @app_commands.describe(enabled="Вкл/выкл (без аргумента — переключить)")
+    async def autoplay(self, interaction: discord.Interaction, enabled: bool | None = None):
+        state = self.get_state(interaction.guild.id)
+        enabled = (not state.autoplay) if enabled is None else enabled
+        self.set_autoplay(interaction.guild, enabled)
+        await interaction.response.send_message(self.autoplay_text(enabled))
+        await self._rerender_panel(state)
 
     # ── /ping ─────────────────────────────────────────────────────────────
     @staticmethod

@@ -1,6 +1,7 @@
 """UI-компоненты: живая панель-плеер (кнопки).
 
-PlayerView  — кнопки ⏮️/Пауза/Продолжить/Пропустить/Повтор/Стоп под эмбедом «сейчас играет».
+PlayerView  — кнопки Назад/В начало/Пауза/Продолжить/Пропустить и
+              Повтор/Перемешать/Автоплей/Стоп под эмбедом «сейчас играет».
 
 Сами действия (пауза, пропуск, постановка в очередь, обновление панели) живут в
 MusicCog — здесь только разметка и проброс кликов в cog, чтобы не дублировать логику.
@@ -27,6 +28,7 @@ class PlayerView(discord.ui.View):
         self.cog = cog
         self.guild_id = guild_id
         self._sync_repeat_button()
+        self._sync_autoplay_button()
 
     def _vc(self, interaction: discord.Interaction) -> discord.VoiceClient | None:
         guild = interaction.guild
@@ -40,6 +42,19 @@ class PlayerView(discord.ui.View):
         self.repeat_btn.style = (
             discord.ButtonStyle.secondary if mode == 0 else discord.ButtonStyle.success
         )
+
+    def _sync_autoplay_button(self) -> None:
+        on = self.cog.get_state(self.guild_id).autoplay
+        self.autoplay_btn.label = f"Автоплей: {'вкл' if on else 'выкл'}"
+        self.autoplay_btn.style = discord.ButtonStyle.success if on else discord.ButtonStyle.secondary
+
+    @discord.ui.button(emoji="⏪", label="Назад", style=discord.ButtonStyle.secondary)
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Предыдущий трек: панель перевыложится сама, когда он заиграет.
+        if self._vc(interaction) is not None and self.cog.go_back(interaction.guild):
+            await interaction.response.defer()
+        else:
+            await interaction.response.send_message("❌ Раньше ничего не играло.", ephemeral=True)
 
     @discord.ui.button(emoji="⏮️", label="В начало", style=discord.ButtonStyle.secondary)
     async def restart_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -81,6 +96,23 @@ class PlayerView(discord.ui.View):
         # Переключаем режим и перерисовываем панель на месте (вид кнопки и эмбед
         # обновятся через refresh_panel_inplace → новый PlayerView).
         self.cog.get_state(self.guild_id).cycle_repeat()
+        await self.cog.refresh_panel_inplace(interaction)
+
+    @discord.ui.button(emoji="🔀", label="Перемешать", style=discord.ButtonStyle.secondary, row=1)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.cog.get_state(self.guild_id)
+        if len(state) < 2:
+            await interaction.response.send_message(
+                "❌ Перемешивать нечего — в очереди меньше двух треков.", ephemeral=True)
+            return
+        state.shuffle()
+        self.cog.queue_changed(interaction.guild)
+        await self.cog.refresh_panel_inplace(interaction)
+
+    @discord.ui.button(emoji="📻", label="Автоплей: выкл", style=discord.ButtonStyle.secondary, row=1)
+    async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = self.cog.get_state(self.guild_id)
+        self.cog.set_autoplay(interaction.guild, not state.autoplay)
         await self.cog.refresh_panel_inplace(interaction)
 
     @discord.ui.button(emoji="⏹️", label="Стоп", style=discord.ButtonStyle.danger, row=1)

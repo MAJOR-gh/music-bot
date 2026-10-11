@@ -15,6 +15,7 @@ import glob
 import json
 import logging
 import os
+import random
 import subprocess
 import tempfile
 import uuid
@@ -63,6 +64,11 @@ MAX_CACHE_DURATION = 60 * 60
 TMP_PREFIX = "musicbot-"
 # Сколько ждать, пока discord.py сам переподключит голос после обрыва.
 RECONNECT_WAIT = 30
+# Кто «заказал» трек, подобранный автоплеем; из скольких самых похожих выбирать.
+AUTOPLAY_NAME = "📻 Автоплей"
+AUTOPLAY_PICK_FROM = 5
+# Длина одного Opus-пакета — по ним считаем, сколько трека уже прозвучало.
+PACKET_SECONDS = 0.02
 
 
 def prefer_pipe() -> bool:
@@ -105,12 +111,20 @@ async def _stream_reachable(url: str) -> bool:
 
 
 class DiscordOpusAudio(discord.FFmpegOpusAudio):
-    """В голос отправляем Opus-аудио, а не служебные заголовки Ogg."""
+    """В голос отправляем Opus-аудио, а не служебные заголовки Ogg.
+
+    packets — сколько пакетов по 20 мс уже ушло в голос (позиция в треке;
+    на паузе discord.py не читает, так что счётчик стоит).
+    """
+
+    packets = 0
 
     def read(self) -> bytes:
         while True:
             packet = super().read()
             if not packet.startswith((b"OpusHead", b"OpusTags")):
+                if packet:
+                    self.packets += 1
                 return packet
 
 
@@ -140,6 +154,14 @@ class MusicPlayer:
         self._playing: tuple[Prepared, subprocess.Popen | None] | None = None
         # Подготовка текущего трека (поиск/скачивание) — её обрывает «Пропустить».
         self._prep_task: asyncio.Task | None = None
+        # Позиция: источник, который сейчас звучит, и с какой секунды он начат.
+        self._source = None
+        self._offset = 0.0
+        # Перемотка: куда перейти (секунды) — плеер переоткроет тот же трек с -ss.
+        self._seek_to: float | None = None
+        # Автоплей: фоновый подбор следующего трека и сид, для которого ничего не нашлось.
+        self._ap_task: asyncio.Task | None = None
+        self._ap_failed: Track | None = None
 
     @property
     def voice_client(self) -> discord.VoiceClient | None:
@@ -297,29 +319,39 @@ class MusicPlayer:
             return False
 
     @staticmethod
-    async def _opus_source(source, *, pipe: bool = False, **kwargs) -> discord.FFmpegOpusAudio:
+    async def _opus_source(source, *, pipe: bool = False, start: float = 0,
+                           **kwargs) -> discord.FFmpegOpusAudio:
         """Источник → Opus 48 кГц с пакетами по 20 мс.
 
         Opus 20 мс (YouTube) копируется как есть — без потери качества.
         Остальное перекодируется в stereo Opus ENCODE_BITRATE без FEC.
-        codec=None принудительно включает libopus.
+        codec=None принудительно включает libopus. start — с какой секунды (перемотка).
         """
-        if not pipe and await MusicPlayer._can_copy(source, kwargs.get("before_options")):
+        copy = not pipe and await MusicPlayer._can_copy(source, kwargs.get("before_options"))
+        # Перемотка: -ss до -i — ffmpeg прыгает по индексу, а не читает всё подряд.
+        # При копировании он встаёт на начало кластера (до пары секунд раньше);
+        # «-ss 0» на выходе выбрасывает эти пакеты — позиция точная до 20 мс.
+        seek = ""
+        if start > 0:
+            kwargs["before_options"] = f"{kwargs.get('before_options') or ''} -ss {start:.2f}".strip()
+            seek = " -ss 0"
+        if copy:
             logger.info("[audio] Opus 20 мс — копирую без перекодирования")
-            return DiscordOpusAudio(source, codec="copy", options=COPY_OPTS, **kwargs)
+            return DiscordOpusAudio(source, codec="copy", options=COPY_OPTS + seek, **kwargs)
         logger.info("[audio] перекодирую в Opus %s кбит/с", ENCODE_BITRATE)
         return DiscordOpusAudio(
             source, codec=None, bitrate=ENCODE_BITRATE,
-            options=FFMPEG_OPTS, pipe=pipe, **kwargs)
+            options=FFMPEG_OPTS + seek, pipe=pipe, **kwargs)
 
     @staticmethod
-    async def _make_source(prepared: Prepared):
-        """→ (AudioSource, процесс yt-dlp для pipe или None)."""
+    async def _make_source(prepared: Prepared, start: float = 0):
+        """→ (AudioSource, процесс yt-dlp для pipe или None). start — только direct/file."""
         if prepared.kind == "direct":
-            src = await MusicPlayer._opus_source(prepared.url, before_options=FFMPEG_BEFORE_OPTS)
+            src = await MusicPlayer._opus_source(
+                prepared.url, before_options=FFMPEG_BEFORE_OPTS, start=start)
             return src, None
         if prepared.kind == "file":
-            return await MusicPlayer._opus_source(prepared.path), None
+            return await MusicPlayer._opus_source(prepared.path, start=start), None
         proc = ytdl.spawn_pipe(prepared.url)
         try:
             src = await MusicPlayer._opus_source(proc.stdout, pipe=True)
@@ -365,6 +397,88 @@ class MusicPlayer:
         self._kill(proc)
         prepared.discard()
 
+    # ── Позиция и перемотка ───────────────────────────────────────────────
+    @property
+    def position(self) -> float | None:
+        """Сколько секунд трека уже прозвучало (None — ничего не играет)."""
+        if self._source is None or self._playing is None:
+            return None
+        return self._offset + getattr(self._source, "packets", 0) * PACKET_SECONDS
+
+    def seek(self, seconds: float) -> str | None:
+        """Перемотать текущий трек. None — получилось, иначе текст ошибки для чата."""
+        vc = self.voice_client
+        track = self.state.current
+        if self._playing is None or track is None or vc is None \
+                or not (vc.is_playing() or vc.is_paused()):
+            return "Сейчас ничего не играет."
+        if self._playing[0].kind == "pipe":
+            return "Эфиры и треки длиннее часа перематывать не умею."
+        seconds = max(0.0, float(seconds))
+        if track.duration and seconds >= track.duration:
+            return "Это уже за концом трека — для следующего есть /skip."
+        self._seek_to = seconds
+        vc.stop()             # → after → плеер переоткроет трек с нужной секунды
+        return None
+
+    # ── Автоплей ──────────────────────────────────────────────────────────
+    def _seen_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for t in (*self.state.history, *self.state.upcoming, self.state.current):
+            if t is not None:
+                keys |= sources.song_keys(t.title, t.uploader, t.webpage_url, t.match)
+        return keys
+
+    async def _autoplay_pick(self, seed: Track) -> Track | None:
+        """Похожий на seed трек, который ещё не играл и не стоит в очереди."""
+        artist, title = seed.match or sources.split_artist_title(seed.title, seed.uploader)
+        results = await sources.similar_tracks(artist, title, seed.webpage_url)
+        seen = self._seen_keys()
+        fresh = [r for r in results if not sources.song_keys(
+            r.title, r.uploader, r.url, None if r.url else (r.uploader or "", r.title)) & seen]
+        if not fresh:
+            logger.info("[autoplay] нет новых похожих на %r", seed.title)
+            return None
+        track = random.choice(fresh[:AUTOPLAY_PICK_FROM]).to_track(AUTOPLAY_NAME)
+        track.autoplay = True
+        return track
+
+    def _autoplay_wanted(self) -> bool:
+        return self.state.autoplay and not self.state.halted and self.state.is_empty
+
+    async def _autoplay_topup(self, seed: Track) -> None:
+        try:
+            track = await self._autoplay_pick(seed)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[autoplay] %r: %s", seed.title, e)
+            track = None
+        if track is None:
+            self._ap_failed = seed
+            return
+        if self._autoplay_wanted():
+            logger.info("[autoplay] дальше: %s — %s", track.uploader, track.title)
+            self.state.add(track)
+            self.schedule_prefetch()
+
+    def schedule_autoplay(self, seed: Track | None = None) -> None:
+        """Очередь пуста, автоплей включён — заранее подобрать следующий трек."""
+        seed = seed or self.state.current or (self.state.history[-1] if self.state.history else None)
+        if seed is None or seed is self._ap_failed or not self._autoplay_wanted():
+            return
+        if self._ap_task is None or self._ap_task.done():
+            self._ap_task = asyncio.ensure_future(self._autoplay_topup(seed))
+
+    async def _autoplay_next(self) -> Track | None:
+        """Очередь кончилась: дождаться подбора автоплея и взять трек."""
+        self.schedule_autoplay()
+        if self._ap_task is not None and not self._ap_task.done():
+            try:
+                await asyncio.shield(self._ap_task)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+        return self.state.get_nowait()
+
     # ── Основной цикл ─────────────────────────────────────────────────────
     async def player_loop(self) -> None:
         """Берёт треки из очереди и играет по одному. Сам выходит при простое."""
@@ -377,6 +491,8 @@ class MusicPlayer:
             self.state.current = None
             await self._notify(self._on_track_change)
         finally:
+            if self._ap_task is not None and not self._ap_task.done():
+                self._ap_task.cancel()
             self.interrupt_preparing()
             self._release_playing()
             self.drop_all_prefetch()
@@ -386,6 +502,8 @@ class MusicPlayer:
         while True:
             self.state.next_event.clear()
             track = self.state.get_nowait()
+            if track is None and self.state.autoplay:
+                track = await self._autoplay_next()
             if track is None:
                 try:
                     await asyncio.wait_for(self.state.next_event.wait(), timeout=self.idle_timeout)
@@ -456,20 +574,24 @@ class MusicPlayer:
                 await self._notify(self._on_track_error, track)
                 continue
             self._playing = (prepared, pipe_proc)
+            self._source, self._offset, self._seek_to = source, 0.0, None
             started_at = self._loop.time()
             logger.info("[player] играет %r (%s) на сервере %s",
                         track.title, prepared.kind, self.state.guild_id)
+            self.state.record_started(track)
             await self._notify(self._on_track_change)
             self.schedule_prefetch()
+            self.schedule_autoplay(track)
 
-            await self.state.next_event.wait()
+            seeked = await self._wait_end(prepared, _after)
             self._playing = None
+            self._source = None
             self._kill(pipe_proc)
             played = self._loop.time() - started_at
 
             # Прямой поток открылся, но умер почти сразу (IP режут) — не считаем
             # трек отыгранным, повторяем его же через скачивание.
-            if (prepared.kind == "direct" and not self.state.skipped
+            if (prepared.kind == "direct" and not self.state.skipped and not seeked
                     and played < 12 and (track.duration or 999) > 30):
                 logger.warning("[player] трек оборвался за %.1fс — повтор через yt-dlp", played)
                 _PREFER_PIPE = True
@@ -497,3 +619,28 @@ class MusicPlayer:
 
             self.state.current = None
             await self._notify(self._on_track_change)
+
+    async def _wait_end(self, prepared: Prepared, after) -> bool:
+        """Ждать конца трека; перемотку отработать тут же (тот же трек с -ss).
+
+        → True, если трек перематывали (тогда «оборвался через 12с» — не обрыв).
+        """
+        seeked = False
+        while True:
+            await self.state.next_event.wait()
+            target, self._seek_to = self._seek_to, None
+            if target is None or self.state.skipped:
+                return seeked
+            self.state.next_event.clear()
+            try:
+                source, _ = await self._make_source(prepared, target)
+                if self.state.skipped:          # пока открывали — «Пропустить»/«Стоп»
+                    source.cleanup()
+                    return seeked
+                self.voice_client.play(source, after=after)
+            except Exception as e:  # noqa: BLE001
+                logger.error("[player] перемотка на %.0fс не удалась: %s", target, e)
+                return seeked
+            self._source, self._offset = source, target
+            seeked = True
+            logger.info("[player] перемотка на %.0fс", target)
