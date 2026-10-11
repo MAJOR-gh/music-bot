@@ -14,7 +14,7 @@ from discord.ext import commands
 
 import config
 from . import player as player_module
-from . import sources, updater, ytdl
+from . import pot, sources, updater, ytdl
 from .player import MusicPlayer
 from .queue import GuildMusicState, RepeatMode
 from .track import SearchResult, Track, short_title
@@ -696,6 +696,7 @@ class MusicCog(commands.Cog):
         js = await asyncio.to_thread(ytdl.js_runtime)
         embed.add_field(name="JS для YouTube", value=f"`{js}`" if js else "❌ нет deno/node",
                         inline=True)
+        embed.add_field(name="PO Token", value=pot.status, inline=True)
         embed.add_field(name="Способ YouTube",
                         value=ytdl.ATTEMPTS[ytdl._preferred].name, inline=True)
         if ytdl.last_bot_check is not None:

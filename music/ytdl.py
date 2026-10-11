@@ -19,10 +19,11 @@ import time
 from dataclasses import dataclass
 
 import config
+from . import pot
 
 logger = logging.getLogger("music_bot.ytdl")
 
-_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+_ENV = pot.env_path({**os.environ, "PYTHONIOENCODING": "utf-8"})
 
 
 class YtdlError(Exception):
@@ -49,6 +50,8 @@ class Attempt:
 # («page needs to be reloaded»), а на части аккаунтов это происходит всегда.
 ATTEMPTS: tuple[Attempt, ...] = (
     Attempt("клиенты по умолчанию"),
+    # mweb отдаёт обычные https-форматы, если есть PO Token (music/pot.py).
+    Attempt("mweb + PO Token", ("--extractor-args", "youtube:player_client=mweb")),
     # Совет мейнтейнеров yt-dlp для кук.
     Attempt("default + web_embedded",
             ("--extractor-args", "youtube:player_client=default,web_embedded")),
@@ -114,6 +117,7 @@ def base_args() -> list[str]:
         args += ["--cookies-from-browser", config.YTDLP_COOKIES_FROM_BROWSER]
     if EXTRACTOR_ARGS:
         args += ["--extractor-args", EXTRACTOR_ARGS]
+    args += pot.ytdlp_args()   # плагин PO Token (если bgutil-pot установлен)
     return args
 
 
