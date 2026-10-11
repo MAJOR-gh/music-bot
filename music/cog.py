@@ -697,6 +697,7 @@ class MusicCog(commands.Cog):
         embed.add_field(name="JS для YouTube", value=f"`{js}`" if js else "❌ нет deno/node",
                         inline=True)
         embed.add_field(name="PO Token", value=pot.status, inline=True)
+        embed.add_field(name="Память", value=ytdl.memory_usage() or "—", inline=True)
         embed.add_field(name="Способ YouTube",
                         value=ytdl.ATTEMPTS[ytdl._preferred].name, inline=True)
         if ytdl.last_bot_check is not None:

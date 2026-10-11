@@ -15,3 +15,4 @@ local_run.log
 # Куки YouTube-аккаунта — секрет
 cookies.txt
 .pot/
+.cache/
