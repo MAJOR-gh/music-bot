@@ -18,7 +18,7 @@ import aiohttp
 
 import config
 from . import ytdl
-from .track import SearchResult
+from .track import SearchResult, parse_time
 
 logger = logging.getLogger("music_bot.sources")
 
@@ -339,6 +339,92 @@ async def search_lastfm(query: str, limit: int) -> list[SearchResult]:
             note=f"{_short(listeners)} слушателей" if listeners else None,
         ))
     return out
+
+
+# ── Автоплей: похожие треки ──────────────────────────────────────────────────
+_VIDEO_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
+
+
+def video_id(url: str | None) -> str | None:
+    m = _VIDEO_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def song_keys(title: str, uploader: str | None, url: str | None,
+              match: tuple[str, str] | None = None) -> set[str]:
+    """Ключи «та же песня»: название без мусора (Official Video…) и id ролика.
+
+    Нужны автоплею, чтобы не включать то, что уже играло или стоит в очереди.
+    """
+    song = match[1] if match else split_artist_title(title, uploader)[1]
+    keys = {"t:" + _norm(song)} if _norm(song) else set()
+    vid = video_id(url)
+    if vid:
+        keys.add("v:" + vid)
+    return keys
+
+
+async def _lastfm_similar(artist: str, title: str, limit: int) -> list[SearchResult]:
+    params = {"method": "track.getsimilar", "artist": artist, "track": title,
+              "autocorrect": "1", "limit": str(limit),
+              "api_key": config.LASTFM_API_KEY, "format": "json"}
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as s:
+        async with s.get("https://ws.audioscrobbler.com/2.0/", params=params) as resp:
+            data = await resp.json(content_type=None)
+    if "error" in data:
+        raise ValueError(f"Last.fm: {data.get('message') or data['error']}")
+    tracks = (data.get("similartracks") or {}).get("track") or []
+    if isinstance(tracks, dict):
+        tracks = [tracks]
+    out = []
+    for t in tracks:
+        name = t.get("name")
+        who = (t.get("artist") or {}).get("name") if isinstance(t.get("artist"), dict) \
+            else t.get("artist")
+        if not name or not who:
+            continue
+        duration = _int(t.get("duration"))
+        if duration and duration > 10_000:      # иногда приходит в миллисекундах
+            duration = round(duration / 1000)
+        out.append(SearchResult(title=name, url=None, duration=duration or None,
+                                uploader=who, source="Last.fm"))
+    return out
+
+
+async def _ytmusic_radio(vid: str, limit: int) -> list[SearchResult]:
+    data = await asyncio.to_thread(_ytmusic().get_watch_playlist,
+                                   videoId=vid, radio=True, limit=limit)
+    out = []
+    for t in (data or {}).get("tracks") or []:
+        tid = t.get("videoId")
+        if not tid or tid == vid:
+            continue
+        artists = ", ".join(a["name"] for a in t.get("artists") or [] if a.get("name"))
+        thumbs = t.get("thumbnail") or t.get("thumbnails") or []
+        out.append(SearchResult(
+            title=t.get("title") or "Unknown", url=youtube_url(tid),
+            duration=parse_time(t.get("length")), uploader=artists or None,
+            source="YT Music", thumbnail=thumbs[-1].get("url") if thumbs else None,
+        ))
+    return out
+
+
+async def similar_tracks(artist: str, title: str, url: str | None = None,
+                         limit: int = 30) -> list[SearchResult]:
+    """Похожие треки, от самых похожих. Last.fm (если задан ключ), иначе — радио YT Music."""
+    found: list[SearchResult] = []
+    if config.LASTFM_API_KEY and artist and title:
+        try:
+            found = await _lastfm_similar(artist, title, limit)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[autoplay] Last.fm для %s — %s: %s", artist, title, e)
+    vid = video_id(url)
+    if not found and vid:
+        try:
+            found = await _ytmusic_radio(vid, limit)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[autoplay] радио YT Music для %s: %s", vid, e)
+    return found
 
 
 async def search(source: str, query: str, limit: int) -> list[SearchResult]:

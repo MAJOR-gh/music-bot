@@ -133,7 +133,11 @@ async def fake_prepare(track: Track) -> Prepared | None:
     return Prepared("file", path=None)
 
 
-async def fake_make_source(prepared: Prepared):
+source_starts: list[float] = []
+
+
+async def fake_make_source(prepared: Prepared, start: float = 0):
+    source_starts.append(start)
     return FakeSource(), None
 
 
@@ -151,6 +155,7 @@ def setup(play_time: float = 0.1, idle: int = 30):
     PREPARE_DELAY = 0.05
     prepare_calls.clear()
     fail_titles.clear()
+    source_starts.clear()
     bot = FakeBot()
     vc = FakeVC(play_time)
     guild = FakeGuild(1, vc)
@@ -633,6 +638,87 @@ async def test_page_reload_retries_with_alt_clients():
     finally:
         ytdl._run_once, ytdl._preferred = orig_run, orig_pref
 
+def test_queue_tools():
+    from music.queue import GuildMusicState
+    from music.track import parse_time
+    assert [parse_time(x) for x in ("90", "2:30", "1:02:03", "2:75", "x")] == [90, 150, 3723, None, None]
+    st = GuildMusicState(1)
+    for name in "abcde":
+        st.add(T(name))
+    names = lambda: [t.title for t in st.upcoming]  # noqa: E731
+    assert st.remove(2).title == "b" and names() == ["a", "c", "d", "e"]
+    assert st.remove(9) is None
+    assert st.move(4, 1).title == "e" and names() == ["e", "a", "c", "d"]
+    assert st.move(1, 99).title == "e" and names() == ["a", "c", "d", "e"]
+    assert st.skip_to(3).title == "d" and names() == ["d", "e"]
+    st.repeat = RepeatMode.ALL
+    assert st.skip_to(2).title == "e" and names() == ["e", "d"]   # «вся очередь» — d в конец
+    auto = T("auto")
+    auto.autoplay = True
+    st.add(auto)
+    st.add(T("mine"))                                # заказанный — перед автоплеем
+    assert names() == ["e", "d", "mine", "auto"]
+    st.shuffle()
+    assert names()[-1] == "auto" and sorted(names()[:3]) == ["d", "e", "mine"]
+    assert st.drop_autoplay() == 1 and "auto" not in names()
+    st.stop()
+    assert st.halted and st.is_empty
+    st.add(T("again"))
+    assert not st.halted
+
+
+async def test_back_button_plays_previous():
+    cog, guild, vc, state = setup(play_time=0.3)
+    cog.enqueue_tracks(guild, [T("a"), T("b")])
+    await wait_until(lambda: cog.played == ["a", "b"], what="a, b")
+    assert cog.go_back(guild)
+    await wait_until(lambda: cog.played == ["a", "b", "a", "b"] and state.current is None,
+                     what="назад → a, потом снова b")
+    await shutdown(cog, guild)
+
+
+async def test_seek_reopens_same_track():
+    cog, guild, vc, state = setup(play_time=0.3)
+    cog.enqueue_tracks(guild, [T("a"), T("b")])
+    await wait_until(lambda: cog.played == ["a"] and source_starts == [0])
+    player = cog._players[guild.id]
+    assert player.seek(500) is not None              # за концом трека
+    assert cog.seek(guild, 42) is None
+    await wait_until(lambda: source_starts == [0, 42], what="переоткрыл с 42с")
+    assert cog.played == ["a"] and state.current.title == "a"   # не новый трек
+    assert cog.position(guild.id) == 42
+    await wait_until(lambda: cog.played == ["a", "b"], what="после перемотки — b")
+    await shutdown(cog, guild)
+
+
+async def test_autoplay_adds_similar_and_stop_halts():
+    cog, guild, vc, state = setup(play_time=0.15)
+    calls = []
+
+    async def fake_similar(artist, title, url=None, limit=30):
+        calls.append(title)
+        return [SearchResult(title=n, url=f"https://youtu.be/{n}", duration=200,
+                             uploader="X", source="YT Music") for n in ("a", "s1", "s2")]
+
+    orig = sources.similar_tracks
+    sources.similar_tracks = fake_similar
+    try:
+        cog.set_autoplay(guild, True)
+        cog.enqueue_tracks(guild, [T("a")])
+        await wait_until(lambda: len(cog.played) >= 3, what="автоплей подобрал треки")
+        assert cog.played[0] == "a" and "a" not in cog.played[1:], cog.played  # без повторов
+        assert set(cog.played[1:3]) == {"s1", "s2"}
+        cog.stop_all(guild)
+        await asyncio.sleep(0.3)
+        n = len(cog.played)
+        await asyncio.sleep(0.3)
+        assert len(cog.played) == n and state.current is None     # «Стоп» — тишина
+        cog.set_autoplay(guild, False)
+    finally:
+        sources.similar_tracks = orig
+    await shutdown(cog, guild)
+
+
 ASYNC_TESTS = [
     test_plays_queue_in_order,
     test_second_enqueue_does_not_cut_current,
@@ -651,10 +737,13 @@ ASYNC_TESTS = [
     test_leave_cancels_player_and_cleans_up,
     test_play_autocomplete,
     test_page_reload_retries_with_alt_clients,
+    test_back_button_plays_previous,
+    test_seek_reopens_same_track,
+    test_autoplay_adds_similar_and_stop_halts,
 ]
 SYNC_TESTS = [test_helpers, test_spotify_parsing, test_match_score_prefers_right_song,
               test_split_artist_title, test_bot_check_detected, test_soundcloud_picks_matching_track,
-              test_discard_file_waits_until_unlocked]
+              test_discard_file_waits_until_unlocked, test_queue_tools]
 
 
 def main() -> int:

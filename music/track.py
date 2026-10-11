@@ -1,6 +1,7 @@
 """Описание одного трека в очереди и одного варианта поиска."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -15,6 +16,23 @@ def format_duration(seconds: int | None, live: bool = False) -> str:
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+_TIME_RE = re.compile(r"^(?:(\d+):)?(?:(\d+):)?(\d+)$")
+
+
+def parse_time(text: str | None) -> int | None:
+    """«90» → 90, «2:30» → 150, «1:02:03» → 3723 (секунды). Непонятное → None."""
+    m = _TIME_RE.match((text or "").strip())
+    if not m:
+        return None
+    parts = [int(p) for p in m.groups() if p is not None]
+    if any(p >= 60 for p in parts[1:]):
+        return None                      # «2:75» — опечатка, а не время
+    total = 0
+    for p in parts:
+        total = total * 60 + p
+    return total
 
 
 def short_title(title: str, limit: int = 60) -> str:
@@ -41,6 +59,7 @@ class Track:
     source: str = "YouTube"       # откуда трек: YouTube / YT Music / Spotify / Last.fm…
     match: tuple[str, str] | None = None  # (исполнитель, название) для поиска на YT Music
     live: bool = False            # прямой эфир — играем живым потоком, не качаем
+    autoplay: bool = False        # подобран автоплеем (такие треки стоят после заказанных)
 
     @property
     def duration_str(self) -> str:
