@@ -440,6 +440,37 @@ def test_soundcloud_picks_matching_track():
         ytdl.extract = real
 
 
+
+async def test_play_autocomplete():
+    """Подсказки /play: варианты из YT Music, кэш, выбор сохраняет метаданные."""
+    from music.cog import suggestion_label
+    calls = []
+
+    async def fake_search(query, limit):
+        calls.append(query)
+        return [SearchResult(title="BFG Division", url="https://www.youtube.com/watch?v=abc",
+                             duration=512, uploader="Mick Gordon"),
+                SearchResult(title="x" * 120, url="https://www.youtube.com/watch?v=def",
+                             duration=None, uploader=None)]
+
+    orig = sources.search_ytmusic
+    sources.search_ytmusic = fake_search
+    try:
+        cog = MusicCog(None, 60)
+        choices = await cog.play_autocomplete(None, "bfg division")
+        assert [c.value for c in choices] == ["https://www.youtube.com/watch?v=abc",
+                                              "https://www.youtube.com/watch?v=def"]
+        assert choices[0].name == "BFG Division - Mick Gordon (8:32)", choices[0].name
+        assert all(len(c.name) <= 100 for c in choices)
+        await cog.play_autocomplete(None, "  BFG   Division ")
+        assert calls == ["bfg division"], calls          # второй раз — из кэша
+        assert cog._ac_results["https://www.youtube.com/watch?v=abc"].uploader == "Mick Gordon"
+        assert await cog.play_autocomplete(None, "b") == []
+        assert await cog.play_autocomplete(None, "https://youtu.be/x") == []
+    finally:
+        sources.search_ytmusic = orig
+    assert suggestion_label(SearchResult(title="T", url=None, duration=None, uploader=None)) == "T"
+
 ASYNC_TESTS = [
     test_plays_queue_in_order,
     test_second_enqueue_does_not_cut_current,
@@ -456,6 +487,7 @@ ASYNC_TESTS = [
     test_idle_timeout_really_disconnects,
     test_player_survives_new_voice_client,
     test_leave_cancels_player_and_cleans_up,
+    test_play_autocomplete,
 ]
 SYNC_TESTS = [test_helpers, test_spotify_parsing, test_match_score_prefers_right_song,
               test_split_artist_title, test_bot_check_detected, test_soundcloud_picks_matching_track,
