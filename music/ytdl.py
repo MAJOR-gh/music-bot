@@ -23,7 +23,16 @@ from . import pot
 
 logger = logging.getLogger("music_bot.ytdl")
 
-_ENV = pot.env_path({**os.environ, "PYTHONIOENCODING": "utf-8"})
+_BOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# deno решает JS-challenge YouTube. На свежем плеере он съедает до ~320 МБ, и на
+# тарифе 512 МБ его убивает OOM-киллер (returncode -9) — звук не отдаётся вовсе.
+# Лимит кучи V8 снижает пик до ~235 МБ (меньше 128 МБ уже не хватает).
+# Свой лимит — DENO_V8_FLAGS в .env.
+DENO_V8_FLAGS = os.getenv("DENO_V8_FLAGS", "--max-old-space-size=144")
+# Кэш yt-dlp в папке бота: в нём лежит разобранный плеер YouTube, и со второго
+# трека deno нужно всего ~120 МБ вместо ~320.
+CACHE_DIR = os.getenv("YTDLP_CACHE_DIR", os.path.join(_BOT_DIR, ".cache", "yt-dlp"))
+_ENV = pot.env_path({**os.environ, "PYTHONIOENCODING": "utf-8", "DENO_V8_FLAGS": DENO_V8_FLAGS})
 
 
 class YtdlError(Exception):
@@ -124,6 +133,7 @@ def base_args() -> list[str]:
         "--no-warnings",
         "--no-playlist",
         "--force-ipv4",
+        "--cache-dir", CACHE_DIR,
         # YouTube требует решать JS-challenge (sig/n); солвер — пакет yt-dlp-ejs.
         "--js-runtimes", "deno",
         "--js-runtimes", "node",
@@ -360,7 +370,29 @@ async def diagnose(url: str) -> list[str]:
     for ln in lines:
         if any(k in ln for k in keys):
             out.append(ln.strip()[:220])
+    if any("returncode: -9" in ln for ln in out):
+        out.append("⚠️ deno убит (код -9) — скорее всего не хватило памяти. "
+                   "Посмотри «Память» в /ping; поможет тариф побольше или DENO_V8_FLAGS.")
     return out[-30:]
+
+
+def memory_usage() -> str | None:
+    """Память контейнера (cgroup): «занято / лимит», если хостинг это показывает."""
+    def read(*paths):
+        for p in paths:
+            try:
+                with open(p) as f:
+                    v = f.read().strip()
+                return None if v == "max" else int(v)
+            except (OSError, ValueError):
+                continue
+        return None
+    used = read("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    limit = read("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if used is None:
+        return None
+    mb = lambda b: f"{b // (1024 * 1024)} МБ"
+    return f"{mb(used)} / {mb(limit)}" if limit and limit < 1 << 50 else mb(used)
 
 
 def js_runtime() -> str | None:
