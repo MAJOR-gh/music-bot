@@ -66,9 +66,10 @@ def _pip_target_args() -> list[str]:
     """На панелях (Pterodactyl) пакеты стоят в .local рядом с ботом — обновляем туда же."""
     spec = importlib.util.find_spec("yt_dlp")
     origin = os.path.abspath(spec.origin) if spec and spec.origin else ""
-    bot_local = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".local")
-    if origin.startswith(bot_local + os.sep):
-        return ["--prefix", bot_local]
+    # …/.local/lib/pythonX.Y/site-packages/yt_dlp/__init__.py → …/.local
+    marker = os.sep + ".local" + os.sep
+    if marker in origin:
+        return ["--prefix", origin[:origin.index(marker) + len(marker) - 1]]
     return []
 
 
