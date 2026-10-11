@@ -693,6 +693,11 @@ class MusicCog(commands.Cog):
         )
         embed.add_field(name="yt-dlp", value=f"`{updater.installed_version() or '—'}`", inline=True)
         embed.add_field(name="Куки YouTube", value=ytdl.cookies_mode() or "нет", inline=True)
+        js = await asyncio.to_thread(ytdl.js_runtime)
+        embed.add_field(name="JS для YouTube", value=f"`{js}`" if js else "❌ нет deno/node",
+                        inline=True)
+        embed.add_field(name="Способ YouTube",
+                        value=ytdl.ATTEMPTS[ytdl._preferred].name, inline=True)
         if ytdl.last_bot_check is not None:
             embed.add_field(
                 name="⚠️ Бот-проверка YouTube",

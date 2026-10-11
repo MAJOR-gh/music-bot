@@ -491,13 +491,13 @@ async def test_page_reload_retries_with_alt_clients():
         ytdl._preferred = 0
         assert await ytdl.download(url, "/tmp/x", 5)
         assert seen[0] == (url, [])
-        assert seen[1] == ("https://music.youtube.com/watch?v=V2SVRJ6dcE4", [])
-        assert seen[2][1] == ["--extractor-args", "youtube:player_client=tv"]
-        assert ytdl._preferred == 2                       # запомнил tv
+        assert seen[1] == (url, ["--extractor-args", "youtube:player_client=default,web_embedded"])
+        assert "-tv_downgraded" in seen[2][1][1]
+        assert ytdl._preferred == 2                       # запомнил сработавший
         seen.clear()
         seen.append(None); seen.append(None)              # следующие вызовы — сразу успех
         assert await ytdl.download(url, "/tmp/x", 5)
-        assert seen[2][1] == ["--extractor-args", "youtube:player_client=tv"]
+        assert "-tv_downgraded" in seen[2][1][1]
 
         seen.clear()
 
@@ -505,6 +505,7 @@ async def test_page_reload_retries_with_alt_clients():
             seen.append(target)
             return False, "ERROR: Video unavailable"
         ytdl._download_once = other
+        ytdl._preferred = 0
         assert not await ytdl.download(url, "/tmp/x", 5)
         assert len(seen) == 1                             # другая ошибка — без перебора
         seen.clear()
@@ -513,11 +514,32 @@ async def test_page_reload_retries_with_alt_clients():
     finally:
         ytdl._download_once, ytdl._preferred = orig, orig_pref
 
+    # Все способы отказали → диагностика, музыкальный способ идёт на music.youtube.com.
+    seen.clear()
+    diag = []
+
+    async def always_reload(target, path, timeout, extra):
+        seen.append((target, extra))
+        return False, "ERROR: The page needs to be reloaded."
+
+    async def fake_diag(u):
+        diag.append(u)
+    ytdl._download_once, orig_diag = always_reload, ytdl._log_diagnosis
+    ytdl._log_diagnosis = fake_diag
+    try:
+        ytdl._preferred = 0
+        assert not await ytdl.download(url, "/tmp/x", 5)
+        assert len(seen) == len(ytdl.ATTEMPTS) and diag == [url]
+        music = [t for t, e in seen if "web_music" in " ".join(e)]
+        assert music == ["https://music.youtube.com/watch?v=V2SVRJ6dcE4"]
+    finally:
+        ytdl._download_once, ytdl._log_diagnosis, ytdl._preferred = orig, orig_diag, orig_pref
+
     calls = []
 
     async def fake_run_once(args, timeout):
         calls.append(args)
-        if len(calls) < 2:
+        if len(calls) < 4:
             raise ytdl.YtdlError("ERROR: The page needs to be reloaded.")
         return b"{}"
 
@@ -527,6 +549,7 @@ async def test_page_reload_retries_with_alt_clients():
         ytdl._preferred = 0
         assert await ytdl.extract(url) == {}
         assert calls[-1][-1] == "https://music.youtube.com/watch?v=V2SVRJ6dcE4"
+        assert "web_music" in " ".join(calls[-1])
         assert ytdl._youtube_id("https://youtu.be/V2SVRJ6dcE4") == "V2SVRJ6dcE4"
         assert ytdl._youtube_id("ytsearch1:bfg") is None
     finally:

@@ -45,12 +45,20 @@ class Attempt:
     music: bool = False          # открыть ролик как music.youtube.com
 
 
+# Источник обходов — yt-dlp#17389: с куками ломается клиент tv_downgraded
+# («page needs to be reloaded»), а на части аккаунтов это происходит всегда.
 ATTEMPTS: tuple[Attempt, ...] = (
     Attempt("клиенты по умолчанию"),
-    Attempt("YouTube Music", music=True),
-    Attempt("клиент tv", ("--extractor-args", "youtube:player_client=tv")),
-    Attempt("клиенты web_safari/web_embedded",
-            ("--extractor-args", "youtube:player_client=web_safari,web_embedded,-tv_downgraded")),
+    # Совет мейнтейнеров yt-dlp для кук.
+    Attempt("default + web_embedded",
+            ("--extractor-args", "youtube:player_client=default,web_embedded")),
+    # Без сломанного tv_downgraded.
+    Attempt("web + web_embedded без tv",
+            ("--extractor-args", "youtube:player_client=web,web_embedded,-tv_downgraded")),
+    # На «проблемных» аккаунтах в issue работал только музыкальный клиент.
+    Attempt("YouTube Music (web_music)",
+            ("--extractor-args", "youtube:player_client=web_music"), music=True),
+    Attempt("web_safari", ("--extractor-args", "youtube:player_client=web_safari")),
 )
 _preferred = 0   # индекс способа, сработавшего последним
 
@@ -243,10 +251,27 @@ async def download(url: str, path: str, timeout: float = 300) -> bool:
             if len(plan) > 1:
                 _remember(i)
             return True
-        if not _should_retry(message) or n == len(plan) - 1:
+        if not _should_retry(message):
+            return False
+        if n == len(plan) - 1:
+            await _log_diagnosis(url)
             return False
         logger.info("[download] пробую: %s", ATTEMPTS[plan[n + 1][0]].name)
     return False
+
+
+_last_diag = 0.0
+
+
+async def _log_diagnosis(url: str) -> None:
+    """Не чаще раза в 30 минут: что именно ответил YouTube (для разбора)."""
+    global _last_diag
+    if time.monotonic() - _last_diag < 1800 and _last_diag:
+        return
+    _last_diag = time.monotonic()
+    logger.warning("[youtube] ни один способ не сработал, диагностика yt-dlp -v:")
+    for line in await diagnose(url):
+        logger.warning("[youtube]   %s", line)
 
 
 async def _download_once(url: str, path: str, timeout: float,
@@ -278,6 +303,40 @@ async def _download_once(url: str, path: str, timeout: float,
         if not ok:
             remove_file(path)
     return ok, message
+
+
+async def diagnose(url: str) -> list[str]:
+    """Короткая выжимка `yt-dlp -v` для лога, когда YouTube не отдал трек ни одним способом."""
+    keys = ("JS runtimes", "Found YouTube account cookies", "playability status",
+            "formats have been skipped", "PO Token", "yt-dlp version", "ERROR")
+    args = base_args() + ["-v", "--simulate", "-f", "bestaudio/best", url]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, env=_ENV)
+        _, err = await asyncio.wait_for(proc.communicate(), 90)
+    except Exception as e:  # noqa: BLE001
+        return [f"диагностика не удалась: {e}"]
+    lines = err.decode("utf-8", "replace").splitlines()
+    out = []
+    for ln in lines:
+        if any(k in ln for k in keys):
+            out.append(ln.strip()[:220])
+    return out[-15:]
+
+
+def js_runtime() -> str | None:
+    """Какой JS-рантайм найдёт yt-dlp (нужен для решения JS-challenge YouTube)."""
+    import shutil
+    for name in ("deno", "node"):
+        path = shutil.which(name)
+        if path:
+            try:
+                ver = subprocess.run([path, "--version"], capture_output=True, text=True,
+                                     timeout=5).stdout.split()[0:2]
+                return f"{name} {' '.join(ver)}".strip()
+            except Exception:  # noqa: BLE001
+                return name
+    return None
 
 
 def spawn_pipe(url: str) -> subprocess.Popen:
