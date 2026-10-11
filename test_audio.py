@@ -132,5 +132,14 @@ class AudioTests(unittest.TestCase):
             spawn.return_value.stdout.close.assert_called_once()
 
 
+class EncoderOptionsTests(unittest.TestCase):
+    def test_disables_discord_fec_overhead(self):
+        """FEC с packet_loss 15 из discord.py даёт слышимый хрип — его надо выключать."""
+        from music.player import FFMPEG_OPTS
+        opts = FFMPEG_OPTS.split()
+        self.assertEqual(opts[opts.index('-fec') + 1], 'false')
+        self.assertEqual(opts[opts.index('-packet_loss') + 1], '0')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

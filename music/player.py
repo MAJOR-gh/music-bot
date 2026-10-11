@@ -38,7 +38,12 @@ FFMPEG_BEFORE_OPTS = (
 # discord.py отправляет один пакет каждые 20 мс и увеличивает RTP timestamp
 # на 960 samples. Копирование исходного Opus НЕ меняет длину пакетов и число
 # каналов: входные 40/60 мс не подходят этому таймингу. Всегда перекодируем.
-FFMPEG_OPTS = "-vn -frame_duration 20"
+# discord.py (FFmpegOpusAudio) жёстко добавляет «-fec true -packet_loss 15»:
+# libopus резервирует часть битрейта под избыточность на 15% потерь, и при
+# перекодировании музыки слышен хрип (замер на тоне: SNR 20 дБ против 37–44 дБ).
+# Наши options идут после аргументов discord.py, поэтому последнее значение
+# выигрывает — выключаем FEC и ожидаемые потери.
+FFMPEG_OPTS = "-vn -frame_duration 20 -fec false -packet_loss 0"
 # Умеренный битрейт выходного stereo Opus (кбит/с).
 ENCODE_BITRATE = 128
 
