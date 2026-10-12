@@ -130,6 +130,8 @@ def base_args() -> list[str]:
         args += ["--cookies", config.YTDLP_COOKIES]
     elif config.YTDLP_COOKIES_FROM_BROWSER:
         args += ["--cookies-from-browser", config.YTDLP_COOKIES_FROM_BROWSER]
+    if config.YTDLP_PROXY:
+        args += ["--proxy", config.YTDLP_PROXY]
     if EXTRACTOR_ARGS:
         args += ["--extractor-args", EXTRACTOR_ARGS]
     args += pot.ytdlp_args()   # плагин PO Token (если bgutil-pot установлен)
@@ -143,7 +145,7 @@ def base_args() -> list[str]:
 BOT_CHECK_MARKERS = ("confirm you're not a bot", "confirm you’re not a bot",
                      "sign in to confirm")
 last_bot_check: float | None = None
-_last_hint = 0.0
+_last_hint: float | None = None
 
 
 def cookies_mode() -> str:
@@ -154,30 +156,109 @@ def cookies_mode() -> str:
     return ""
 
 
+# Без этих кук YouTube не считает файл входом в аккаунт.
+LOGIN_COOKIES = ("LOGIN_INFO", "__Secure-3PSID", "SAPISID")
+_BAR = "═" * 64
+
+
+def check_cookies_file(path: str | None) -> list[str]:
+    """Проблемы cookies.txt словами (пусто — файл выглядит рабочим). Значения кук не читаем в лог."""
+    if not path:
+        return []
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return [f"не открывается: {e}"]
+    problems = []
+    text = raw.decode("utf-8", "replace")
+    first = text.lstrip("\ufeff").splitlines()[0].strip() if text.strip() else ""
+    if first not in ("# Netscape HTTP Cookie File", "# HTTP Cookie File"):
+        problems.append("первая строка должна быть «# Netscape HTTP Cookie File» — "
+                        "выгрузи расширением Get cookies.txt LOCALLY")
+    if b"\r\n" in raw:
+        problems.append("переводы строк Windows (CRLF) — в Notepad++: Правка → "
+                        "Формат конца строк → Unix (LF)")
+    now = time.time()
+    names, expired = set(), set()
+    for line in text.splitlines():
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        parts = line.strip().split("\t")
+        if len(parts) < 7 or line.startswith("#") or "youtube.com" not in parts[0]:
+            continue
+        names.add(parts[5])
+        try:
+            exp = int(float(parts[4]))
+        except ValueError:
+            exp = 0
+        if 0 < exp < now:
+            expired.add(parts[5])
+    if not names:
+        problems.append("нет ни одной куки youtube.com — выгружал не на вкладке YouTube?")
+    else:
+        missing = [n for n in LOGIN_COOKIES if n not in names]
+        if missing:
+            problems.append(f"нет кук входа ({', '.join(missing)}) — выгружено без входа в "
+                            "аккаунт (в инкогнито расширению нужно разрешение)")
+        dead = [n for n in LOGIN_COOKIES if n in expired]
+        if dead:
+            problems.append(f"истёк срок у {', '.join(dead)} — выгрузи заново")
+    return problems
+
+
+def log_cookies_status() -> None:
+    """При старте: сразу видно, годится ли cookies.txt."""
+    if not config.YTDLP_COOKIES:
+        logger.info("[cookies] cookies.txt нет — YouTube может требовать вход на хостинге")
+        return
+    problems = check_cookies_file(config.YTDLP_COOKIES)
+    if not problems:
+        logger.info("[cookies] cookies.txt выглядит рабочим (куки входа YouTube на месте)")
+        return
+    logger.error("\n%s\n⛔ cookies.txt НЕ ГОДИТСЯ:\n%s\n%s", _BAR,
+                 "\n".join(f"   • {p}" for p in problems), _BAR)
+
+
 def note_error(message: str) -> None:
-    """Если YouTube требует вход — запомнить и (не чаще раза в 10 минут) подсказать, что делать."""
+    """Если YouTube требует вход — запомнить и (не чаще раза в 10 минут) крупно написать в лог."""
     global last_bot_check, _last_hint
     low = message.lower()
     if not any(m in low for m in BOT_CHECK_MARKERS):
         return
     last_bot_check = time.time()
-    if time.monotonic() - _last_hint < 600:
+    if _last_hint is not None and time.monotonic() - _last_hint < 600:
         return
     _last_hint = time.monotonic()
+    lines = ["⛔ YOUTUBE ЗАБЛОКИРОВАЛ БОТА («Sign in to confirm you're not a bot»)"]
     if cookies_mode():
-        logger.warning("[youtube] YouTube требует вход, хотя куки заданы (%s) — куки протухли "
-                       "или аккаунт разлогинило: экспортируй cookies.txt заново.", cookies_mode())
+        problems = check_cookies_file(config.YTDLP_COOKIES)
+        if problems:
+            lines.append("   Куки: cookies.txt есть, но с ним беда:")
+            lines += [f"     • {p}" for p in problems]
+        else:
+            lines.append(f"   Куки: {cookies_mode()} — заданы, но YouTube их не принял "
+                         "(протухли/сессию закрыли).")
+        lines.append("   1) Выгрузи куки заново: окно инкогнито → вход в YouTube → "
+                     "youtube.com/robots.txt → Get cookies.txt LOCALLY → СРАЗУ закрыть окно.")
     else:
-        logger.warning("[youtube] YouTube считает IP ботом («Sign in to confirm you're not a bot»). "
-                       "Лечится куками аккаунта YouTube: положи cookies.txt рядом с ботом "
-                       "(или YTDLP_COOKIES_FROM_BROWSER=firefox в .env при запуске на своём ПК). "
-                       "Пока что бот ищет такие треки на SoundCloud.")
+        lines.append("   Куки: нет. 1) Положи cookies.txt рядом с ботом (см. README).")
+    if pot.ENABLED:
+        lines.append(f"   PO Token: {pot.status}")
+    else:
+        lines.append("   2) PO Token выключен — впиши POT_ENABLED=1 в .env и перезапусти.")
+    lines.append("   Если и с новыми куками сразу то же — YouTube забанил IP хостинга: "
+                 "нужен дом/прокси (YTDLP_PROXY).")
+    logger.error("\n%s\n%s\n%s", _BAR, "\n".join(lines), _BAR)
 
 
 def _last_error_line(stderr: bytes) -> str:
     lines = [ln for ln in stderr.decode("utf-8", "replace").splitlines() if ln.strip()]
     errors = [ln for ln in lines if "ERROR" in ln]
-    return (errors or lines or ["неизвестная ошибка"])[-1][:300]
+    line = (errors or lines or ["неизвестная ошибка"])[-1]
+    # Хвост «Use --cookies-from-browser… See https://…» одинаковый и только шумит в логе.
+    line = line.split(" Use --cookies-from-browser")[0]
+    return line[:300]
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:

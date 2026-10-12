@@ -65,6 +65,8 @@ YTDLP_COOKIES: str | None = _cookies if os.path.isfile(_cookies) else None
 # Или брать куки прямо из браузера на этом ПК (firefox, chrome, edge…) — только
 # если файла cookies.txt нет. На хостинге браузера нет — там нужен cookies.txt.
 YTDLP_COOKIES_FROM_BROWSER: str = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+# Прокси для yt-dlp (http://user:pass@host:port или socks5://…), если YouTube забанил IP хостинга.
+YTDLP_PROXY: str = os.getenv("YTDLP_PROXY", "").strip()
 
 # Хостинги-панели (Pterodactyl) ставят пакеты через `pip --prefix .local`:
 # бинарники из pip (deno — JS-рантайм для yt-dlp) лежат в .local/bin,

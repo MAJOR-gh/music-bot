@@ -360,10 +360,12 @@ class MusicCog(commands.Cog):
         state = self.get_state(guild_id)
         if state.text_channel is None:
             return
+        text = f"⚠️ Не получилось сыграть **{short_title(track.title, 100)}** — пропускаю."
+        if ytdl.last_bot_check and time.time() - ytdl.last_bot_check < 120:
+            text += ("\n⛔ YouTube заблокировал бота («Sign in to confirm you're not a bot»): "
+                     "нужны свежие куки (cookies.txt). Подробности — в консоли.")
         try:
-            await state.text_channel.send(
-                f"⚠️ Не получилось сыграть **{short_title(track.title, 100)}** — пропускаю."
-            )
+            await state.text_channel.send(text)
         except discord.HTTPException:
             pass
 
