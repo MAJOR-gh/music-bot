@@ -719,6 +719,25 @@ async def test_autoplay_adds_similar_and_stop_halts():
     await shutdown(cog, guild)
 
 
+def test_cookies_file_check():
+    d = tempfile.mkdtemp()
+    good = os.path.join(d, "good.txt")
+    far = int(time.time()) + 10**7
+    with open(good, "w", newline="\n") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for name in ytdl.LOGIN_COOKIES:
+            f.write(f".youtube.com\tTRUE\t/\tTRUE\t{far}\t{name}\tx\n")
+    assert ytdl.check_cookies_file(good) == []
+    bad = os.path.join(d, "bad.txt")
+    with open(bad, "wb") as f:
+        f.write(b"# Netscape HTTP Cookie File\r\n.youtube.com\tTRUE\t/\tTRUE\t1\tPREF\tx\r\n")
+    problems = " ".join(ytdl.check_cookies_file(bad))
+    assert "CRLF" in problems and "LOGIN_INFO" in problems, problems
+    line = ytdl._last_error_line(b"ERROR: [youtube] x: Sign in to confirm you're not a bot. "
+                                 b"Use --cookies-from-browser or --cookies for the auth")
+    assert line.endswith("not a bot."), line
+
+
 ASYNC_TESTS = [
     test_plays_queue_in_order,
     test_second_enqueue_does_not_cut_current,
@@ -743,7 +762,8 @@ ASYNC_TESTS = [
 ]
 SYNC_TESTS = [test_helpers, test_spotify_parsing, test_match_score_prefers_right_song,
               test_split_artist_title, test_bot_check_detected, test_soundcloud_picks_matching_track,
-              test_discard_file_waits_until_unlocked, test_queue_tools]
+              test_discard_file_waits_until_unlocked, test_queue_tools,
+              test_cookies_file_check]
 
 
 def main() -> int:

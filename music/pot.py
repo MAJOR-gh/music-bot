@@ -7,9 +7,8 @@
 
 Всё ставится само при старте (Linux x86_64): бинарник и плагин скачиваются
 в папку .pot рядом с ботом, сервер запускается фоном и перезапускается, если упал.
-По умолчанию ВЫКЛЮЧЕН: сервер держит ~70 МБ памяти, а на тарифах с 512 МБ
-из-за этого не хватало памяти deno (JS-challenge) и YouTube не играл вовсе.
-Включить: POT_ENABLED=1 в .env.
+По умолчанию ВКЛЮЧЁН. Сервер держит ~70 МБ памяти: на крошечных тарифах
+(≤512 МБ) из-за этого не хватает памяти deno — тогда POT_ENABLED=0 в .env.
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ logger = logging.getLogger("music_bot.pot")
 
 VERSION = os.getenv("POT_VERSION", "v0.8.1").strip()
 PORT = int(os.getenv("POT_PORT", "4416"))
-ENABLED = os.getenv("POT_ENABLED", "0").strip() not in ("0", "false", "no", "")
+ENABLED = os.getenv("POT_ENABLED", "1").strip() not in ("0", "false", "no", "")
 _RELEASES = "https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/download"
 BIN_ASSET = "bgutil-pot-linux-x86_64"
 PLUGIN_ASSET = "bgutil-ytdlp-pot-provider-rs.zip"

@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from music import pot, updater
+from music import pot, updater, ytdl
 from music.cog import setup_cog
 from music.player import cleanup_stale_files
 
@@ -54,6 +54,7 @@ class MusicBot(commands.Bot):
             pass
 
     async def setup_hook(self) -> None:
+        ytdl.log_cookies_status()
         removed = cleanup_stale_files()
         if removed:
             logger.info("Удалено %d временных файлов от прошлого запуска", removed)
