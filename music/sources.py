@@ -12,6 +12,8 @@ import json
 import logging
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import aiohttp
@@ -138,15 +140,32 @@ async def soundcloud_alternatives(artist: str, title: str,
 
 
 # ── YouTube Music ─────────────────────────────────────────────────────────────
-_ytm = None
+# Отдельные потоки: зависший поиск не занимает общий executor asyncio.
+_YTM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ytmusic")
+_YTM_LOCAL = threading.local()
 
 
 def _ytmusic():
-    global _ytm
-    if _ytm is None:
-        from ytmusicapi import YTMusic   # импорт тут: модуль нужен только для YT Music
-        _ytm = YTMusic()
-    return _ytm
+    # Вызывается только внутри рабочего потока, включая сетевую инициализацию.
+    # Session и клиент не разделяются между потоками.
+    if not hasattr(_YTM_LOCAL, "client"):
+        import requests
+        from ytmusicapi import YTMusic
+
+        class TimedSession(requests.Session):
+            def request(self, method, url, **kwargs):
+                if kwargs.get("timeout") is None:
+                    kwargs["timeout"] = (3, 5)
+                return super().request(method, url, **kwargs)
+
+        _YTM_LOCAL.client = YTMusic(requests_session=TimedSession())
+    return _YTM_LOCAL.client
+
+
+async def _ytmusic_call(method: str, **kwargs):
+    def run():
+        return getattr(_ytmusic(), method)(**kwargs)
+    return await asyncio.get_running_loop().run_in_executor(_YTM_EXECUTOR, run)
 
 
 def _ytm_to_result(s: dict) -> SearchResult | None:
@@ -165,7 +184,7 @@ def _ytm_to_result(s: dict) -> SearchResult | None:
 
 
 async def search_ytmusic(query: str, limit: int) -> list[SearchResult]:
-    found = await asyncio.to_thread(_ytmusic().search, query, filter="songs", limit=limit)
+    found = await _ytmusic_call("search", query=query, filter="songs", limit=limit)
     return [r for r in (_ytm_to_result(s) for s in found) if r][:limit]
 
 
@@ -392,8 +411,7 @@ async def _lastfm_similar(artist: str, title: str, limit: int) -> list[SearchRes
 
 
 async def _ytmusic_radio(vid: str, limit: int) -> list[SearchResult]:
-    data = await asyncio.to_thread(_ytmusic().get_watch_playlist,
-                                   videoId=vid, radio=True, limit=limit)
+    data = await _ytmusic_call("get_watch_playlist", videoId=vid, radio=True, limit=limit)
     out = []
     for t in (data or {}).get("tracks") or []:
         tid = t.get("videoId")
