@@ -95,8 +95,6 @@ class MusicCog(commands.Cog):
         # Автокомплит /play: запрос → результаты и ссылка → выбранный результат.
         self._ac_cache: dict[str, list[SearchResult]] = {}
         self._ac_results: dict[str, SearchResult] = {}
-        self._ac_pending: dict[str, asyncio.Task] = {}
-        self._ac_latest: dict[int, object] = {}
 
     # ── Вспомогательное ───────────────────────────────────────────────────
     def get_state(self, guild_id: int) -> GuildMusicState:
@@ -504,8 +502,7 @@ class MusicCog(commands.Cog):
     # ── Подсказки при вводе /play (как всплывающий список у Eara) ─────────
     # Discord ждёт ответ на автокомплит ≤3 с и шлёт запрос на каждую букву,
     # поэтому ищем в YouTube Music (быстро, без куки YouTube) и кэшируем.
-    _AC_TIMEOUT = 1.2
-    _AC_MAX_PENDING = 2
+    _AC_TIMEOUT = 2.5
     _AC_CACHE_MAX = 200
 
     async def _suggest(self, query: str, source: str = "ytmusic") -> list[SearchResult]:
@@ -514,40 +511,23 @@ class MusicCog(commands.Cog):
         if key in cache:
             cache[key] = cache.pop(key)  # LRU: свежий — в конец
             return cache[key]
-        task = self._ac_pending.get(key)
-        if task is None:
-            # Не плодим запросы на каждую букву при медленной сети.
-            if len(self._ac_pending) >= self._AC_MAX_PENDING:
-                return []
-            task = asyncio.create_task(self._fetch_suggestions(key, query, source))
-            self._ac_pending[key] = task
-        # Таймаут ответа Discord не отменяет работающий поток: он закончит
-        # запрос и прогреет кэш. До этого его слот остаётся занятым.
-        return await asyncio.wait_for(asyncio.shield(task), self._AC_TIMEOUT)
-
-    async def _fetch_suggestions(self, key: str, query: str,
-                                 source: str) -> list[SearchResult]:
-        try:
-            if source == "lastfm":
-                search = sources.search_lastfm
-            elif source == "spotify":
-                search = sources.search_spotify
-            else:
-                search = sources.search_ytmusic
-            results = await search(query, AUTOCOMPLETE_LIMIT)
-            self._ac_cache[key] = results
-            for r in results:
-                self._ac_results[suggestion_value(r)] = r
-            while len(self._ac_cache) > self._AC_CACHE_MAX:
-                self._ac_cache.pop(next(iter(self._ac_cache)))
-            while len(self._ac_results) > self._AC_CACHE_MAX * 5:
-                self._ac_results.pop(next(iter(self._ac_results)))
-            return results
-        except Exception as e:  # noqa: BLE001 — фоновая задача всегда забирает ошибку
-            logger.debug("[autocomplete] %r: %s", query, e)
-            return []
-        finally:
-            self._ac_pending.pop(key, None)
+        if source == "lastfm":
+            search = sources.search_lastfm
+        elif source == "spotify":
+            search = sources.search_spotify
+        else:
+            search = sources.search_ytmusic
+        # У Spotify/Last.fm нет ссылки на звук: в value уйдёт «spotify:…»/«lastfm:…»,
+        # а сам трек плеер найдёт на YouTube Music перед игрой.
+        results = await asyncio.wait_for(search(query, AUTOCOMPLETE_LIMIT), self._AC_TIMEOUT)
+        cache[key] = results
+        for r in results:
+            self._ac_results[suggestion_value(r)] = r
+        while len(cache) > self._AC_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        while len(self._ac_results) > self._AC_CACHE_MAX * 5:
+            self._ac_results.pop(next(iter(self._ac_results)))
+        return results
 
     @staticmethod
     def _suggest_source(interaction: discord.Interaction) -> str:
@@ -567,29 +547,14 @@ class MusicCog(commands.Cog):
     async def play_autocomplete(
         self, interaction: discord.Interaction, current: str,
     ) -> list[app_commands.Choice[str]]:
-        created = getattr(interaction, "created_at", None)
-        if created is not None:
-            age = (discord.utils.utcnow() - created).total_seconds()
-            if age > 1.0:
-                return []  # оставляем время на отправку ответа Discord
         current = (current or "").strip()
         if len(current) < 2 or _is_url(current):
             return []
-        user_id = getattr(getattr(interaction, "user", None), "id", None)
-        token = object()
         try:
-            if user_id is not None:
-                self._ac_latest[user_id] = token
-                await asyncio.sleep(0.2)  # при быстром вводе ищем последнюю строку
-                if self._ac_latest.get(user_id) is not token:
-                    return []
             results = await self._suggest(current, self._suggest_source(interaction))
         except Exception as e:  # noqa: BLE001 — таймаут/ошибка: просто без подсказок
             logger.debug("[autocomplete] %r: %s", current, e)
             return []
-        finally:
-            if user_id is not None and self._ac_latest.get(user_id) is token:
-                self._ac_latest.pop(user_id, None)
         return [
             app_commands.Choice(name=suggestion_label(r), value=suggestion_value(r))
             for r in results
