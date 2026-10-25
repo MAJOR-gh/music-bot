@@ -31,7 +31,9 @@ Spotify и Last.fm. Очередь — отдельная для каждого 
 
 Дополнительно:
 - 🔎 Подсказки прямо при вводе `/play`: до 25 вариантов из YouTube Music (или
-  Last.fm) во всплывающем списке Discord. Enter без выбора — играет первый результат.
+  Last.fm) во всплывающем списке Discord. Enter без выбора — играет первая подсказка.
+- ⚡ Ссылка на YouTube разбирается за доли секунды (метаданные из YouTube Music);
+  yt-dlp запускается уже только за звуком.
 - 🔁 Повтор одного трека или всей очереди — командой `/repeat` или кнопкой на панели.
 - 🎛️ Кнопки на панели: ⏪ Назад, ⏮️ В начало, пауза, пропуск, 🔁 Повтор, 🔀 Перемешать, 📻 Автоплей, ⏹️ Стоп.
 - ⏩ Перемотка без перекодирования: Opus с YouTube по-прежнему идёт как есть.
@@ -55,22 +57,24 @@ Spotify и Last.fm. Очередь — отдельная для каждого 
 ## Структура проекта
 
 ```
-music_bot/
+music-bot/
 ├── main.py             # точка входа, настройка бота и синхронизация команд
-├── config.py           # загрузка .env
+├── config.py           # загрузка .env, поиск ffmpeg/deno на хостинге
 ├── requirements.txt
 ├── .env.example
-├── README.md
-├── test_bot.py         # офлайн-тесты: python test_bot.py
+├── Dockerfile
+├── CHANGELOG.md
+├── test_bot.py         # офлайн-тесты логики: python test_bot.py
+├── test_audio.py       # тесты звукового тракта (нужен FFmpeg): python test_audio.py
 └── music/
-    ├── __init__.py
     ├── track.py        # dataclass Track / SearchResult
     ├── queue.py        # GuildMusicState — очередь и состояние сервера
     ├── player.py       # MusicPlayer — подготовка треков, предзагрузка, цикл воспроизведения
     ├── ytdl.py         # yt-dlp в отдельных процессах (поиск, метаданные, скачивание)
     ├── sources.py      # поиск: YouTube, YouTube Music, Spotify, Last.fm, SoundCloud
     ├── updater.py      # автообновление yt-dlp
-    ├── ui.py           # кнопки панели и выпадающий список поиска
+    ├── pot.py          # PO Token для YouTube (bgutil-pot, по умолчанию выключен)
+    ├── ui.py           # кнопки живой панели
     └── cog.py          # MusicCog — слэш-команды
 ```
 
@@ -80,12 +84,11 @@ music_bot/
   на его страницу. У треков из Spotify/Last.fm ссылки нет — её найдёт плеер.
 - **`GuildMusicState`** (`queue.py`) — очередь (`deque`), текущий трек,
   `asyncio.Event` для управления плеером. Один экземпляр на сервер.
-- **`MusicPlayer`** (`player.py`) — готовит трек (находит на YT Music, качает
-  через `yt-dlp` во временный файл) и крутит `player_loop`, проигрывая треки через
-  `discord.FFmpegOpusAudio`: все источники приводятся к stereo Opus 48 кГц,
-  128 кбит/с и пакетам по 20 мс (без копирования исходных Opus-пакетов).
-  yt-dlp работает отдельными процессами (`ytdl.py`),
-  поэтому не тормозит отправку звука.
+- **`MusicPlayer`** (`player.py`) — готовит трек (находит на YT Music, берёт прямой
+  поток или качает через `yt-dlp` во временный файл) и крутит `player_loop`.
+  Opus 48 кГц с пакетами по 20 мс (так отдаёт YouTube) идёт в голос без
+  перекодирования; остальное перекодируется в stereo Opus 256 кбит/с (`AUDIO_BITRATE`).
+  yt-dlp работает отдельными процессами (`ytdl.py`), поэтому не тормозит отправку звука.
 - **`MusicCog`** (`cog.py`) — слэш-команды и словарь состояний по серверам.
 
 ---
@@ -132,8 +135,8 @@ sudo pacman -S ffmpeg
 1. Зайди на **https://discord.com/developers/applications** → **New Application**, дай имя.
 2. Слева открой вкладку **Bot** → **Add Bot** (Reset Token, если нужно) → скопируй **TOKEN**.
    Это и есть `DISCORD_TOKEN` для `.env`. Никому его не показывай.
-3. В разделе **Bot** включи тумблер **Server Members Intent** *(не обязателен,
-   но желателен)*. **Message Content Intent НЕ нужен** — бот работает на слэш-командах.
+3. Привилегированные интенты (**Server Members**, **Message Content**) **не нужны** —
+   бот работает на слэш-командах.
 4. Слева **OAuth2 → URL Generator**:
    - **Scopes:** отметь `bot` и `applications.commands`.
    - **Bot Permissions:** `View Channels`, `Connect`, `Speak`,
@@ -150,7 +153,7 @@ sudo pacman -S ffmpeg
 
 ```bash
 # 1. Перейти в папку проекта
-cd music_bot
+cd music-bot
 
 # 2. (рекомендуется) Виртуальное окружение
 python -m venv .venv
@@ -192,13 +195,14 @@ python main.py
 | `403 / Sign in to confirm` от YouTube | Обнови yt-dlp; если не помогло — положи `cookies.txt` аккаунта YouTube рядом с ботом |
 | «Поиск по Spotify не настроен» | Впиши ключи Spotify в `.env` или ищи через YouTube Music (ссылки Spotify работают и так) |
 
-### Проверка звукового тракта
+## Тесты
 
 ```bash
-python test_audio.py
+python test_bot.py      # очередь, плеер, кнопки, поиск — без Discord и интернета
+python test_audio.py    # звуковой тракт
 ```
 
-Тесты используют установленный FFmpeg с `libopus`, без Discord, токена и
+`test_audio.py` использует установленный FFmpeg с `libopus`, без Discord, токена и
 интернета. Проверяются файл, прямой HTTP-поток на localhost и yt-dlp pipe
 (подменён локальным процессом), mono/stereo Opus с пакетами по 20/60 мс,
 AAC и PCM. На выходе должны быть только аудиопакеты по 20 мс в stereo.

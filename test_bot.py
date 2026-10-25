@@ -31,7 +31,11 @@ class FakeSource:
 
 
 class FakeVC:
-    """Голосовое подключение: «играет» трек play_time секунд, потом зовёт after."""
+    """Голосовое подключение: «играет» трек play_time секунд, потом зовёт after.
+
+    Как и discord.py, after вызывается всегда — даже если stop() пришёл раньше,
+    чем «воспроизведение» успело начаться.
+    """
 
     def __init__(self, play_time: float):
         self.play_time = play_time
@@ -40,7 +44,6 @@ class FakeVC:
         self.connected = True
         self.disconnected = False
         self._task: asyncio.Task | None = None
-        self._after = None
         self._paused = False
         self._stopping = False
 
@@ -56,17 +59,13 @@ class FakeVC:
     def play(self, source, *, after) -> None:
         if self._task is not None:
             raise RuntimeError("Already playing audio.")
-        self._after, self._paused, self._stopping = after, False, False
-        self._task = asyncio.get_running_loop().create_task(self._run())
+        self._paused, self._stopping = False, False
+        self._task = asyncio.get_running_loop().create_task(asyncio.sleep(self.play_time))
+        self._task.add_done_callback(lambda _: self._finished(after))
 
-    async def _run(self) -> None:
-        try:
-            await asyncio.sleep(self.play_time)
-        except asyncio.CancelledError:
-            pass
-        after, self._after, self._task = self._after, None, None
-        if after:
-            after(None)
+    def _finished(self, after) -> None:
+        self._task = None
+        after(None)
 
     def pause(self) -> None:
         self._paused = True
@@ -453,15 +452,17 @@ def test_soundcloud_picks_matching_track():
         assert urls == ["sc/full"], urls   # 30-секундный отрывок Go+ пропущен
         assert "preview" in ytdl.format_for("https://api.soundcloud.com/tracks/1")
         assert ytdl.format_for("https://youtu.be/x") == "bestaudio/best"
-        from music import updater
-        pypi = {"info": {"version": "2026.8.19"}, "releases": {
-            "2026.8.19": [{}], "2026.10.10.233141.dev0": [{}], "2026.11.1": [{"yanked": True}]}}
-        assert updater.pick_latest(pypi, False) == "2026.8.19"
-        assert updater.pick_latest(pypi, True) == "2026.10.10.233141.dev0"
-        assert updater.version_tuple("2026.10.10.233141.dev0") > updater.version_tuple("2026.8.19")
     finally:
         ytdl.extract = real
 
+
+def test_updater_picks_latest():
+    from music import updater
+    pypi = {"info": {"version": "2026.8.19"}, "releases": {
+        "2026.8.19": [{}], "2026.10.10.233141.dev0": [{}], "2026.11.1": [{"yanked": True}]}}
+    assert updater.pick_latest(pypi, False) == "2026.8.19"
+    assert updater.pick_latest(pypi, True) == "2026.10.10.233141.dev0"
+    assert updater.version_tuple("2026.10.10.233141.dev0") > updater.version_tuple("2026.8.19")
 
 
 async def test_play_autocomplete():
@@ -555,13 +556,13 @@ async def test_page_reload_retries_with_alt_clients():
     """Плавающие отказы YouTube: перебор клиентов, YT Music, запоминание сработавшего."""
     url = "https://www.youtube.com/watch?v=V2SVRJ6dcE4"
     seen = []
+    failures = ["ERROR: [youtube] x: The page needs to be reloaded.",
+                "ERROR: [youtube] x: Requested format is not available."]
 
     async def fake_once(target, path, timeout, extra):
         seen.append((target, extra))
-        if len(seen) == 1:
-            return False, "ERROR: [youtube] x: The page needs to be reloaded."
-        if len(seen) == 2:
-            return False, "ERROR: [youtube] x: Requested format is not available."
+        if failures:
+            return False, failures.pop(0)
         return True, None
 
     orig, orig_pref = ytdl._download_once, ytdl._preferred
@@ -574,9 +575,8 @@ async def test_page_reload_retries_with_alt_clients():
         assert seen[2][1] == ["--extractor-args", "youtube:player_client=default,web_embedded"]
         assert ytdl._preferred == 2                       # запомнил сработавший
         seen.clear()
-        seen.append(None); seen.append(None)              # следующие вызовы — сразу успех
-        assert await ytdl.download(url, "/tmp/x", 5)
-        assert seen[2][1] == ["--extractor-args", "youtube:player_client=default,web_embedded"]
+        assert await ytdl.download(url, "/tmp/x", 5)      # следующий трек — сразу через него
+        assert seen == [(url, ["--extractor-args", "youtube:player_client=default,web_embedded"])]
 
         seen.clear()
 
@@ -633,10 +633,113 @@ async def test_page_reload_retries_with_alt_clients():
         assert await ytdl.extract(url) == {}
         assert calls[-1][-1] == "https://music.youtube.com/watch?v=V2SVRJ6dcE4"
         assert "web_music" in " ".join(calls[-1])
-        assert ytdl._youtube_id("https://youtu.be/V2SVRJ6dcE4") == "V2SVRJ6dcE4"
-        assert ytdl._youtube_id("ytsearch1:bfg") is None
+        assert ytdl.video_id("https://youtu.be/V2SVRJ6dcE4") == "V2SVRJ6dcE4"
+        assert ytdl.video_id("https://www.youtube.com/watch?app=desktop&v=V2SVRJ6dcE4") == "V2SVRJ6dcE4"
+        assert ytdl.video_id("ytsearch1:bfg") is None
     finally:
         ytdl._run_once, ytdl._preferred = orig_run, orig_pref
+
+
+async def test_extract_cooldown_after_all_clients_fail():
+    """extract, как и download: все способы отказали → дальше пробуется только один."""
+    calls = []
+
+    async def always_reload(args, timeout):
+        calls.append(args)
+        raise ytdl.YtdlError("ERROR: The page needs to be reloaded.")
+
+    orig, orig_pref = ytdl._run_once, ytdl._preferred
+    ytdl._run_once = always_reload
+    try:
+        ytdl._preferred, ytdl._all_failed_at = 0, 0.0
+        url = "https://www.youtube.com/watch?v=V2SVRJ6dcE4"
+        for expected in (len(ytdl.ATTEMPTS), 1):
+            calls.clear()
+            try:
+                await ytdl.extract(url)
+                raise AssertionError("extract должен был упасть")
+            except ytdl.YtdlError:
+                pass
+            assert len(calls) == expected, (expected, len(calls))
+    finally:
+        ytdl._run_once, ytdl._preferred, ytdl._all_failed_at = orig, orig_pref, 0.0
+
+
+async def test_youtube_link_metadata_without_ytdlp():
+    """Ссылка YouTube: название берётся из YouTube Music, yt-dlp не запускается."""
+    async def fast(vid):
+        assert vid == "V2SVRJ6dcE4"
+        return SearchResult(title="Song", url=sources.youtube_url(vid), duration=200, uploader="Band")
+
+    async def no_ytdlp(*args, **kwargs):
+        raise AssertionError("yt-dlp не нужен")
+
+    orig_info, orig_extract = sources.youtube_info, ytdl.extract
+    sources.youtube_info, ytdl.extract = fast, no_ytdlp
+    try:
+        track = await MusicCog(None, 60)._track_from_url("https://youtu.be/V2SVRJ6dcE4?t=5", "me")
+        assert (track.title, track.duration, track.uploader) == ("Song", 200, "Band")
+        assert track.webpage_url == "https://www.youtube.com/watch?v=V2SVRJ6dcE4"
+
+        async def unknown(vid):          # эфир / недоступный ролик → как раньше, через yt-dlp
+            return None
+
+        async def ytdlp(target, *, flat=False, timeout=60):
+            return {"title": "Live", "webpage_url": target, "is_live": True}
+        sources.youtube_info, ytdl.extract = unknown, ytdlp
+        track = await MusicCog(None, 60)._track_from_url("https://youtu.be/V2SVRJ6dcE4", "me")
+        assert track.title == "Live" and track.live
+    finally:
+        sources.youtube_info, ytdl.extract = orig_info, orig_extract
+
+
+async def test_play_enter_uses_shown_suggestion():
+    """Enter без выбора подсказки играет первую из показанных, без нового поиска."""
+    import types
+    cog = MusicCog(None, 60)
+    shown = SearchResult(title="BFG Division", url="https://www.youtube.com/watch?v=abcdefghijk",
+                         duration=512, uploader="Mick Gordon", source="YT Music")
+    cog._ac_cache[cog._ac_key("bfg division", "ytmusic")] = [shown]
+    sent, queued = [], []
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def voice(interaction):
+        return object()
+
+    async def enqueue(interaction, tracks):
+        queued.extend(tracks)
+        return True
+
+    async def send(text=None, **kwargs):
+        sent.append(text)
+
+    async def no_search(*args, **kwargs):
+        raise AssertionError("поиск не нужен — подсказка уже была")
+
+    cog._ensure_voice, cog.enqueue = voice, enqueue
+    inter = types.SimpleNamespace(
+        response=types.SimpleNamespace(defer=noop), followup=types.SimpleNamespace(send=send),
+        user=types.SimpleNamespace(display_name="me"), namespace=types.SimpleNamespace(source=None))
+    orig = sources.search
+    sources.search = no_search
+    try:
+        await MusicCog.play.callback(cog, inter, "  BFG   Division ", None)
+    finally:
+        sources.search = orig
+    assert [t.title for t in queued] == ["BFG Division"], queued
+    assert sent and "BFG Division" in sent[0], sent
+
+
+def test_private_urls_rejected():
+    from music.cog import _is_public_url
+    for url in ("http://127.0.0.1:4416/ping", "http://localhost/x", "http://169.254.169.254/latest",
+                "http://10.0.0.5/", "http://[::1]/", "http://printer.local/"):
+        assert not _is_public_url(url), url
+    for url in ("https://www.youtube.com/watch?v=x", "https://soundcloud.com/a/b", "https://8.8.8.8/"):
+        assert _is_public_url(url), url
+
 
 def test_queue_tools():
     from music.queue import GuildMusicState
@@ -740,10 +843,14 @@ ASYNC_TESTS = [
     test_back_button_plays_previous,
     test_seek_reopens_same_track,
     test_autoplay_adds_similar_and_stop_halts,
+    test_extract_cooldown_after_all_clients_fail,
+    test_youtube_link_metadata_without_ytdlp,
+    test_play_enter_uses_shown_suggestion,
 ]
 SYNC_TESTS = [test_helpers, test_spotify_parsing, test_match_score_prefers_right_song,
               test_split_artist_title, test_bot_check_detected, test_soundcloud_picks_matching_track,
-              test_discard_file_waits_until_unlocked, test_queue_tools]
+              test_updater_picks_latest, test_discard_file_waits_until_unlocked, test_queue_tools,
+              test_private_urls_rejected]
 
 
 def main() -> int:

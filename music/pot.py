@@ -77,9 +77,16 @@ async def _download(session: aiohttp.ClientSession, url: str, dest: str) -> None
     os.replace(tmp, dest)
 
 
+def _installed_version() -> str:
+    try:
+        with open(VERSION_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 async def install() -> bool:
-    current = open(VERSION_FILE).read().strip() if os.path.isfile(VERSION_FILE) else ""
-    if installed() and current == VERSION:
+    if installed() and _installed_version() == VERSION:
         return True
     os.makedirs(PLUGIN_DIR, exist_ok=True)
     logger.info("[pot] скачиваю bgutil-pot %s…", VERSION)

@@ -1,25 +1,20 @@
-"""UI-компоненты: живая панель-плеер (кнопки).
+"""Кнопки живой панели-плеера под эмбедом «сейчас играет».
 
-PlayerView  — кнопки Назад/В начало/Пауза/Продолжить/Пропустить и
-              Повтор/Перемешать/Автоплей/Стоп под эмбедом «сейчас играет».
-
-Сами действия (пауза, пропуск, постановка в очередь, обновление панели) живут в
-MusicCog — здесь только разметка и проброс кликов в cog, чтобы не дублировать логику.
+Сами действия (пауза, пропуск, обновление панели) живут в MusicCog — здесь только
+разметка и проброс кликов в cog, чтобы не дублировать логику.
 """
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import discord
 
+from .queue import RepeatMode
+
 if TYPE_CHECKING:
     from .cog import MusicCog
 
-logger = logging.getLogger("music_bot.ui")
 
-
-# ── Кнопки управления плеером ──────────────────────────────────────────────────
 class PlayerView(discord.ui.View):
     """Кнопки под эмбедом «сейчас играет». Привязаны к конкретному серверу."""
 
@@ -40,7 +35,7 @@ class PlayerView(discord.ui.View):
         self.repeat_btn.emoji = mode.emoji
         self.repeat_btn.label = f"Повтор: {mode.label}"
         self.repeat_btn.style = (
-            discord.ButtonStyle.secondary if mode == 0 else discord.ButtonStyle.success
+            discord.ButtonStyle.secondary if mode is RepeatMode.OFF else discord.ButtonStyle.success
         )
 
     def _sync_autoplay_button(self) -> None:

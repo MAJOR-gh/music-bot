@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -81,9 +82,10 @@ _all_failed_at = 0.0
 _YT_ID_RE = re.compile(r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)([\w-]{11})")
 
 
-def _youtube_id(url: str) -> str | None:
+def video_id(url: str | None) -> str | None:
+    """ID ролика из ссылки YouTube / YouTube Music / youtu.be / shorts."""
     m = _YT_ID_RE.search(url or "")
-    return m.group(1) if m and "music.youtube.com" not in url else None
+    return m.group(1) if m else None
 
 
 def _should_retry(message: str | None) -> bool:
@@ -93,8 +95,8 @@ def _should_retry(message: str | None) -> bool:
 
 def _plan(url: str) -> list[tuple[int, list[str], str]]:
     """(индекс, доп. флаги, ссылка) — начиная со сработавшего в прошлый раз."""
-    vid = _youtube_id(url)
-    if vid is None:                       # не YouTube (SoundCloud и т. п.) — одна попытка
+    vid = video_id(url) if "music.youtube.com" not in (url or "") else None
+    if vid is None:                       # не YouTube (SoundCloud, YT Music) — одна попытка
         return [(0, [], url)]
     order = [_preferred] + [i for i in range(len(ATTEMPTS)) if i != _preferred]
     if _all_failed_at and time.monotonic() - _all_failed_at < COOLDOWN:
@@ -189,17 +191,35 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
     await proc.wait()
 
 
+def _plan_succeeded(plan: list, i: int) -> None:
+    global _all_failed_at
+    if len(plan) > 1 or _all_failed_at:
+        _remember(i)
+    _all_failed_at = 0.0
+
+
+def _plan_exhausted(plan: list) -> None:
+    """Отказали все способы — на COOLDOWN секунд оставить только один (см. _plan)."""
+    global _all_failed_at
+    if len(plan) > 1:
+        _all_failed_at = time.monotonic()
+        logger.info("[youtube] все способы отказали — %d мин пробую только «%s», "
+                    "дальше снова все", int(COOLDOWN // 60), ATTEMPTS[_preferred].name)
+
+
 async def _run(args: list[str], timeout: float) -> bytes:
     """Запуск yt-dlp (последний аргумент — ссылка); на плавающих отказах YouTube — другие клиенты."""
     plan = _plan(args[-1])
     for n, (i, extra, target) in enumerate(plan):
         try:
             out = await _run_once(args[:-1] + extra + [target], timeout)
-            if len(plan) > 1:
-                _remember(i)
+            _plan_succeeded(plan, i)
             return out
         except YtdlError as e:
-            if not _should_retry(str(e)) or n == len(plan) - 1:
+            if not _should_retry(str(e)):
+                raise
+            if n == len(plan) - 1:
+                _plan_exhausted(plan)
                 raise
             logger.info("[youtube] %s — пробую: %s", str(e)[-80:], ATTEMPTS[plan[n + 1][0]].name)
     raise AssertionError("unreachable")
@@ -272,22 +292,17 @@ async def download(url: str, path: str, timeout: float = 300) -> bool:
     При любой неудаче и при отмене (трек убрали из очереди) файл удаляется.
     На плавающих отказах YouTube перебирает клиенты (см. ATTEMPTS).
     """
-    global _all_failed_at
     plan = _plan(url)
     for n, (i, extra, target) in enumerate(plan):
         ok, message = await _download_once(target, path, timeout, extra)
         if ok:
-            if len(plan) > 1 or _all_failed_at:
-                _remember(i)
-            _all_failed_at = 0.0
+            _plan_succeeded(plan, i)
             return True
         if not _should_retry(message):
             return False
         if n == len(plan) - 1:
             if len(plan) > 1:
-                _all_failed_at = time.monotonic()
-                logger.info("[youtube] все способы отказали — %d мин пробую только «%s», "
-                            "дальше снова все", int(COOLDOWN // 60), ATTEMPTS[_preferred].name)
+                _plan_exhausted(plan)
                 await _log_diagnosis(url)
             return False
         logger.info("[download] пробую: %s", ATTEMPTS[plan[n + 1][0]].name)
@@ -385,7 +400,6 @@ def memory_usage() -> str | None:
 
 def js_runtime() -> str | None:
     """Какой JS-рантайм найдёт yt-dlp (нужен для решения JS-challenge YouTube)."""
-    import shutil
     for name in ("deno", "node"):
         path = shutil.which(name)
         if path:

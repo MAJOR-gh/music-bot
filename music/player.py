@@ -460,6 +460,11 @@ class MusicPlayer:
             self.state.add(track)
             self.schedule_prefetch()
 
+    def resume_autoplay(self) -> None:
+        """Автоплей снова включили — забыть прошлую неудачу и сразу подобрать трек."""
+        self._ap_failed = None
+        self.schedule_autoplay()
+
     def schedule_autoplay(self, seed: Track | None = None) -> None:
         """Очередь пуста, автоплей включён — заранее подобрать следующий трек."""
         seed = seed or self.state.current or (self.state.history[-1] if self.state.history else None)

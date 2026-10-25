@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import shutil
 import time
@@ -54,11 +55,19 @@ def _is_url(query: str) -> bool:
     return q.startswith("http://") or q.startswith("https://")
 
 
-def _to_int(v) -> int | None:
+def _is_public_url(url: str) -> bool:
+    """Ссылка ведёт в интернет, а не внутрь хостинга (localhost, 10.x, 169.254.x…).
+
+    yt-dlp открывает любой адрес, и название страницы уходит в чат — без этой
+    проверки через /play можно было заглянуть во внутреннюю сеть контейнера.
+    """
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if not host or host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
     try:
-        return int(float(v)) if v not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return True     # обычное доменное имя
 
 
 def _source_name(url: str) -> str:
@@ -131,7 +140,7 @@ class MusicCog(commands.Cog):
             elif vc.channel != channel:
                 await vc.move_to(channel)
         except Exception as e:  # noqa: BLE001
-            logger.error("[voice] connect failed on guild %s: %s", interaction.guild.id, e)
+            logger.error("[voice] не подключился к голосу на сервере %s: %s", interaction.guild.id, e)
             await interaction.followup.send(
                 "❌ Не получилось подключиться к голосовому каналу "
                 "(таймаут голосового рукопожатия). Подробности — в консоли бота.",
@@ -268,8 +277,7 @@ class MusicCog(commands.Cog):
         if enabled:
             state.halted = False
             if player is not None:
-                player._ap_failed = None
-                player.schedule_autoplay()
+                player.resume_autoplay()
             if state.current is None and state.is_empty and state.history:
                 self._wake(guild)         # очередь уже кончилась — сразу подобрать трек
         else:
@@ -449,7 +457,16 @@ class MusicCog(commands.Cog):
         return ok
 
     async def _track_from_url(self, url: str, requester: str) -> Track | None:
-        """Ссылка YouTube/SoundCloud/… → Track с названием и длительностью."""
+        """Ссылка YouTube/SoundCloud/… → Track с названием и длительностью.
+
+        Ролик YouTube сначала ищем в YouTube Music (~0,3 с): yt-dlp ради одного
+        названия решает JS-challenge 5+ секунд, а звук плеер всё равно достанет сам.
+        """
+        vid = ytdl.video_id(url)
+        if vid:
+            found = await sources.youtube_info(vid)
+            if found is not None:
+                return found.to_track(requester)
         try:
             info = ytdl.first_entry(await ytdl.extract(url, flat=True, timeout=45))
         except ytdl.YtdlError as e:
@@ -460,7 +477,7 @@ class MusicCog(commands.Cog):
             return Track(
                 title=info.get("title") or url,
                 webpage_url=page,
-                duration=_to_int(info.get("duration")),
+                duration=sources.to_int(info.get("duration")),
                 uploader=info.get("uploader") or info.get("channel"),
                 thumbnail=ytdl.best_thumbnail(info),
                 requested_by=requester,
@@ -499,14 +516,17 @@ class MusicCog(commands.Cog):
         await self._disconnect(interaction.guild.id)
 
     # ── /play ─────────────────────────────────────────────────────────────
-    # ── Подсказки при вводе /play (как всплывающий список у Eara) ─────────
-    # Discord ждёт ответ на автокомплит ≤3 с и шлёт запрос на каждую букву,
-    # поэтому ищем в YouTube Music (быстро, без куки YouTube) и кэшируем.
+    # Подсказки при вводе: Discord ждёт ответ на автокомплит ≤3 с и шлёт запрос
+    # на каждую букву, поэтому ищем в YouTube Music (быстро, без куки) и кэшируем.
     _AC_TIMEOUT = 2.5
     _AC_CACHE_MAX = 200
 
+    @staticmethod
+    def _ac_key(query: str, source: str) -> str:
+        return source + "\0" + " ".join(query.lower().split())
+
     async def _suggest(self, query: str, source: str = "ytmusic") -> list[SearchResult]:
-        key = source + "\0" + " ".join(query.lower().split())
+        key = self._ac_key(query, source)
         cache = self._ac_cache
         if key in cache:
             cache[key] = cache.pop(key)  # LRU: свежий — в конец
@@ -606,7 +626,11 @@ class MusicCog(commands.Cog):
             return
 
         # Выбран вариант из подсказок → метаданные уже есть, yt-dlp не нужен.
+        # Enter без выбора → первая подсказка, которую человек видел в списке.
         picked = self._ac_results.get(query)
+        if picked is None and source is None and not _is_url(query):
+            shown = self._ac_cache.get(self._ac_key(query, self._suggest_source(interaction)))
+            picked = shown[0] if shown else None
         if picked is not None:
             track = picked.to_track(requester)
             if not await self._resolve(interaction, track):
@@ -616,8 +640,11 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(self.enqueue_message(was_idle, track))
             return
 
-        # Ссылка → играем сразу. Текст без выбора подсказки → первый результат.
+        # Ссылка → играем сразу. Текст без подсказок → первый результат поиска.
         if _is_url(query):
+            if not _is_public_url(query):
+                await interaction.followup.send("❌ Такие ссылки не открываю.")
+                return
             track = await self._track_from_url(query, requester)
             if track is None:
                 await interaction.followup.send(f"❌ Не удалось загрузить: `{query}`")
@@ -1003,10 +1030,8 @@ class MusicCog(commands.Cog):
         vc = guild.voice_client
         if vc is None or vc.channel is None:
             return
-        # Считаем людей (не ботов) в канале бота
-        humans = [m for m in vc.channel.members if not m.bot]
-        if not humans:
-            logger.info("[voice] no humans left on guild %s — disconnecting", guild.id)
+        if not any(not m.bot for m in vc.channel.members):
+            logger.info("[voice] в канале не осталось людей на сервере %s — отключаюсь", guild.id)
             await self._disconnect(guild.id)
 
 

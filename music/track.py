@@ -95,7 +95,6 @@ class SearchResult:
     uploader: str | None
     source: str = "YouTube"
     thumbnail: str | None = None
-    note: str | None = None       # доп. строка в списке (напр. слушатели Last.fm)
     live: bool = False
 
     @property

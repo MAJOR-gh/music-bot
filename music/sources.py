@@ -1,8 +1,8 @@
 """Источники поиска: YouTube, YouTube Music, Spotify, Last.fm (+ запасной SoundCloud).
 
-Звук берётся с YouTube через yt-dlp (SoundCloud — только если SOUNDCLOUD_FALLBACK=1). Spotify и Last.fm дают
-только «что за трек» (исполнитель + название) — такой трек плеер перед игрой
-находит на YouTube Music функцией find_on_ytmusic().
+Звук берётся с YouTube через yt-dlp (SoundCloud — только при SOUNDCLOUD_FALLBACK=1).
+Spotify и Last.fm дают только «что за трек» (исполнитель + название) — такой трек
+плеер перед игрой находит на YouTube Music функцией find_on_ytmusic().
 """
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ async def search_youtube(query: str, limit: int) -> list[SearchResult]:
         if not url:
             continue
         out.append(SearchResult(
-            title=e.get("title") or "Unknown", url=url, duration=_int(e.get("duration")),
+            title=e.get("title") or "Unknown", url=url, duration=to_int(e.get("duration")),
             uploader=e.get("uploader") or e.get("channel"), source="YouTube",
             thumbnail=ytdl.best_thumbnail(e),
             live=e.get("live_status") == "is_live" or bool(e.get("is_live")),
@@ -123,7 +123,7 @@ async def soundcloud_alternatives(artist: str, title: str,
         url = e and (e.get("url") or e.get("webpage_url"))
         if url:
             found.append(SearchResult(
-                title=e.get("title") or "", url=url, duration=_int(e.get("duration")),
+                title=e.get("title") or "", url=url, duration=to_int(e.get("duration")),
                 uploader=e.get("uploader"), source="SoundCloud",
             ))
     full = [r for r in found if not _is_preview(r, duration)]
@@ -154,19 +154,48 @@ def _ytm_to_result(s: dict) -> SearchResult | None:
     if not vid:
         return None
     artists = ", ".join(a["name"] for a in s.get("artists") or [] if a.get("name"))
-    album = (s.get("album") or {}).get("name")
     thumbs = s.get("thumbnails") or []
     return SearchResult(
         title=s.get("title") or "Unknown", url=youtube_url(vid),
-        duration=_int(s.get("duration_seconds")), uploader=artists or None,
+        duration=to_int(s.get("duration_seconds")), uploader=artists or None,
         source="YT Music", thumbnail=thumbs[-1]["url"] if thumbs else None,
-        note=album,
     )
 
 
 async def search_ytmusic(query: str, limit: int) -> list[SearchResult]:
     found = await asyncio.to_thread(_ytmusic().search, query, filter="songs", limit=limit)
     return [r for r in (_ytm_to_result(s) for s in found) if r][:limit]
+
+
+async def warm_up() -> None:
+    """Прогреть YouTube Music при старте: первый запрос (импорт, TLS) идёт ~2 с,
+    а автокомплит Discord ждёт ответ не дольше 3 с."""
+    try:
+        await asyncio.to_thread(_ytmusic().search, "music", filter="songs", limit=1)
+    except Exception as e:  # noqa: BLE001
+        logger.info("[ytmusic] прогрев не удался: %s", e)
+
+
+async def youtube_info(vid: str) -> SearchResult | None:
+    """Метаданные ролика через YouTube Music: ~0,3 с против 5+ с у yt-dlp.
+
+    Эфиры, недоступные и необычные ролики → None: их разбирает yt-dlp.
+    """
+    try:
+        song = await asyncio.wait_for(asyncio.to_thread(_ytmusic().get_song, vid), 5)
+    except Exception as e:  # noqa: BLE001
+        logger.info("[ytmusic] get_song %s: %s", vid, e)
+        return None
+    details = song.get("videoDetails") or {}
+    status = (song.get("playabilityStatus") or {}).get("status")
+    if status != "OK" or details.get("isLiveContent") or not details.get("title"):
+        return None
+    thumbs = (details.get("thumbnail") or {}).get("thumbnails") or []
+    return SearchResult(
+        title=details["title"], url=youtube_url(vid), duration=to_int(details.get("lengthSeconds")),
+        uploader=details.get("author"), source="YouTube",
+        thumbnail=thumbs[-1].get("url") if thumbs else None,
+    )
 
 
 _NORM_RE = re.compile(r"[^\w\s]+", re.UNICODE)
@@ -308,7 +337,6 @@ async def search_spotify(query: str, limit: int) -> list[SearchResult]:
             title=t.get("name") or "Unknown", url=None, duration=_ms(t.get("duration_ms")),
             uploader=", ".join(a["name"] for a in t.get("artists") or []),
             source="Spotify", thumbnail=images[0]["url"] if images else None,
-            note=(t.get("album") or {}).get("name"),
         ))
     return out
 
@@ -330,26 +358,11 @@ async def search_lastfm(query: str, limit: int) -> list[SearchResult]:
     tracks = ((data.get("results") or {}).get("trackmatches") or {}).get("track") or []
     if isinstance(tracks, dict):
         tracks = [tracks]
-    out = []
-    for t in tracks:
-        listeners = _int(t.get("listeners"))
-        out.append(SearchResult(
-            title=t.get("name") or "Unknown", url=None, duration=None,
-            uploader=t.get("artist"), source="Last.fm",
-            note=f"{_short(listeners)} слушателей" if listeners else None,
-        ))
-    return out
+    return [SearchResult(title=t.get("name") or "Unknown", url=None, duration=None,
+                         uploader=t.get("artist"), source="Last.fm") for t in tracks]
 
 
 # ── Автоплей: похожие треки ──────────────────────────────────────────────────
-_VIDEO_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([\w-]{11})")
-
-
-def video_id(url: str | None) -> str | None:
-    m = _VIDEO_ID_RE.search(url or "")
-    return m.group(1) if m else None
-
-
 def song_keys(title: str, uploader: str | None, url: str | None,
               match: tuple[str, str] | None = None) -> set[str]:
     """Ключи «та же песня»: название без мусора (Official Video…) и id ролика.
@@ -358,7 +371,7 @@ def song_keys(title: str, uploader: str | None, url: str | None,
     """
     song = match[1] if match else split_artist_title(title, uploader)[1]
     keys = {"t:" + _norm(song)} if _norm(song) else set()
-    vid = video_id(url)
+    vid = ytdl.video_id(url)
     if vid:
         keys.add("v:" + vid)
     return keys
@@ -383,7 +396,7 @@ async def _lastfm_similar(artist: str, title: str, limit: int) -> list[SearchRes
             else t.get("artist")
         if not name or not who:
             continue
-        duration = _int(t.get("duration"))
+        duration = to_int(t.get("duration"))
         if duration and duration > 10_000:      # иногда приходит в миллисекундах
             duration = round(duration / 1000)
         out.append(SearchResult(title=name, url=None, duration=duration or None,
@@ -418,7 +431,7 @@ async def similar_tracks(artist: str, title: str, url: str | None = None,
             found = await _lastfm_similar(artist, title, limit)
         except Exception as e:  # noqa: BLE001
             logger.warning("[autoplay] Last.fm для %s — %s: %s", artist, title, e)
-    vid = video_id(url)
+    vid = ytdl.video_id(url)
     if not found and vid:
         try:
             found = await _ytmusic_radio(vid, limit)
@@ -440,7 +453,7 @@ async def search(source: str, query: str, limit: int) -> list[SearchResult]:
 
 
 # ── мелочи ────────────────────────────────────────────────────────────────────
-def _int(v) -> int | None:
+def to_int(v) -> int | None:
     try:
         return int(float(v)) if v not in (None, "") else None
     except (TypeError, ValueError):
@@ -448,13 +461,5 @@ def _int(v) -> int | None:
 
 
 def _ms(v) -> int | None:
-    v = _int(v)
+    v = to_int(v)
     return round(v / 1000) if v else None
-
-
-def _short(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}k"
-    return str(n)

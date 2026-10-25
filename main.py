@@ -10,11 +10,10 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from music import pot, updater
+from music import pot, sources, updater
 from music.cog import setup_cog
 from music.player import cleanup_stale_files
 
-# ── Логирование ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -22,20 +21,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("music_bot")
 
-# ── Intents ───────────────────────────────────────────────────────────────────
-# voice_states нужен для отслеживания голосовых каналов.
-intents = discord.Intents.default()
-intents.voice_states = True
-intents.guilds = True
+intents = discord.Intents.default()  # guilds и voice_states в нём уже есть
 
 
 class MusicBot(commands.Bot):
     def __init__(self):
         # Текстовых команд нет — только слэш. when_mentioned убирает ложное
         # предупреждение «Privileged message content intent is missing».
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
-        self._updater_task: asyncio.Task | None = None
-        self._pot_task: asyncio.Task | None = None
+        # allowed_mentions=none: названия треков с YouTube приходят от кого угодно —
+        # «@everyone» в названии не должен пинговать сервер.
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents,
+                         allowed_mentions=discord.AllowedMentions.none())
+        self._background: list[asyncio.Task] = []
         self.tree.on_error = self._on_app_command_error
 
     async def _on_app_command_error(
@@ -58,38 +55,29 @@ class MusicBot(commands.Bot):
         if removed:
             logger.info("Удалено %d временных файлов от прошлого запуска", removed)
         if config.YTDLP_AUTO_UPDATE:
-            self._updater_task = asyncio.create_task(updater.updater_loop())
+            self._background.append(asyncio.create_task(updater.updater_loop()))
         # PO Token для YouTube: без него клиенты с куками получают «page needs to be reloaded».
-        self._pot_task = asyncio.create_task(pot.run_forever())
+        self._background.append(asyncio.create_task(pot.run_forever()))
         atexit.register(pot.stop)
+        self._background.append(asyncio.create_task(sources.warm_up()))
 
         await setup_cog(self, config.IDLE_TIMEOUT)
 
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
-
-            # Снимок команд ДО синка — чтобы в логах показать, что изменилось
-            # этим деплоем (появились ли новые команды, пропали ли старые).
+            # Снимок до синка — чтобы в логе было видно, что изменил этот деплой.
             try:
                 before = {c.name for c in await self.tree.fetch_commands(guild=guild)}
             except discord.HTTPException:
                 before = set()
 
-            # Железобетонная защита от дублей в списке команд. Команда в Discord
-            # «двоится», когда у приложения одновременно есть ГЛОБАЛЬНАЯ и
-            # ГИЛЬДИЙНАЯ копии одной команды (типичное наследие старого деплоя,
-            # который синкал и туда, и туда). Поэтому каждый старт приводим обе
-            # области к чистому состоянию:
-
-            # 1) Копируем команды (зарегистрированы как глобальные) в гильдию.
+            # Команда «двоится», если у приложения есть и глобальная, и гильдийная
+            # копия. Поэтому команды живут только в гильдии, а глобальные гасим.
             self.tree.copy_global_to(guild=guild)
-
-            # 2) Гасим ГЛОБАЛЬНЫЕ команды на стороне Discord (пушим пустой список).
             self.tree.clear_commands(guild=None)
             await self.tree.sync()
             logger.info("Глобальные команды очищены (защита от дублей)")
 
-            # 3) Пушим гильдийные — появляются мгновенно и в одном экземпляре.
             synced = await self.tree.sync(guild=guild)
             logger.info(
                 "Синхронизировано %d гильдийных команд для guild %s: %s",
@@ -97,7 +85,6 @@ class MusicBot(commands.Bot):
                 ", ".join(sorted(c.name for c in synced)),
             )
 
-            # Дифф с прошлым запуском — что именно добавил/убрал этот деплой.
             after = {c.name for c in synced}
             added, removed = after - before, before - after
             if added:
@@ -107,9 +94,6 @@ class MusicBot(commands.Bot):
             if not added and not removed:
                 logger.info("Состав команд не изменился")
         else:
-            # Глобальный режим: чистим возможные гильдийные остатки нельзя без
-            # списка гильдий, но глобальный sync сам приводит глобальную область
-            # к актуальному списку (без дублей внутри неё).
             synced = await self.tree.sync()
             logger.info(
                 "Синхронизировано %d глобальных команд (обновление списка у "
