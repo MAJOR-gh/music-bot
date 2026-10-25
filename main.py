@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
-from music import pot, sources, updater
+from music import VERSION, pot, sources, updater
 from music.cog import setup_cog
 from music.player import cleanup_stale_files
 
@@ -101,7 +101,7 @@ class MusicBot(commands.Bot):
             )
 
     async def on_ready(self) -> None:
-        logger.info("✅ Бот онлайн: %s (id=%s)", self.user, self.user.id)
+        logger.info("✅ Бот онлайн: %s (id=%s) • v%s", self.user, self.user.id, VERSION)
         logger.info(
             "Если в списке команд всё ещё видны дубли — это кэш клиента Discord: "
             "нажми Ctrl+R в приложении, список обновится."

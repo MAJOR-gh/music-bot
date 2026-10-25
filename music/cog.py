@@ -14,6 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import config
+from . import VERSION
 from . import player as player_module
 from . import pot, sources, updater, ytdl
 from .player import MusicPlayer
@@ -25,6 +26,7 @@ logger = logging.getLogger("music_bot.cog")
 
 # Discord показывает максимум 25 вариантов автокомплита.
 AUTOCOMPLETE_LIMIT = 25
+STARTED = time.monotonic()      # для аптайма в /ping
 
 
 def suggestion_label(r: SearchResult) -> str:
@@ -969,10 +971,11 @@ class MusicCog(commands.Cog):
         vc = interaction.guild.voice_client
         state = self.get_state(interaction.guild.id)
 
-        embed = discord.Embed(title="🏓 Понг! Диагностика", color=0x5865F2)
+        uptime = int(time.monotonic() - STARTED)
+        embed = discord.Embed(title=f"🏓 Понг! Бот v{VERSION}", color=0x5865F2)
         embed.add_field(
             name="Discord Gateway",
-            value=f"`{self.bot.latency * 1000:.0f} мс`",
+            value=f"`{self.bot.latency * 1000:.0f} мс` · работает {uptime // 3600} ч {uptime % 3600 // 60} мин",
             inline=True,
         )
         embed.add_field(name="YouTube", value=fmt(youtube_ms), inline=True)
