@@ -241,11 +241,17 @@ async def _run_once(args: list[str], timeout: float) -> bytes:
     return out
 
 
-async def extract(target: str, *, flat: bool = False, timeout: float = 60) -> dict:
-    """Метаданные по ссылке или запросу (`ytsearch5:…`). flat — без похода в каждое видео."""
+async def extract(target: str, *, flat: bool = False, timeout: float = 60,
+                  playlist_end: int | None = None) -> dict:
+    """Метаданные по ссылке или запросу (`ytsearch5:…`). flat — без похода в каждое видео.
+
+    playlist_end — взять из плейлиста только первые N роликов.
+    """
     args = base_args() + ["-J", "-f", format_for(target)]
     if flat:
         args.append("--flat-playlist")
+    if playlist_end:
+        args += ["--playlist-end", str(playlist_end)]
     args.append(target)
     try:
         out = await _run(args, timeout)

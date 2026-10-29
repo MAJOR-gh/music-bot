@@ -59,12 +59,12 @@ def youtube_url(video_id: str) -> str:
 
 
 # ── YouTube ───────────────────────────────────────────────────────────────────
-async def search_youtube(query: str, limit: int) -> list[SearchResult]:
-    data = await ytdl.extract(f"ytsearch{limit}:{query}", flat=True, timeout=40)
+def _ytdlp_results(data: dict | None) -> list[SearchResult]:
+    """entries из yt-dlp (--flat-playlist) → варианты; удалённые и скрытые ролики пропускаем."""
     out = []
-    for e in data.get("entries") or []:
+    for e in (data or {}).get("entries") or []:
         url = e and (e.get("url") or e.get("webpage_url"))
-        if not url:
+        if not url or e.get("title") in ("[Deleted video]", "[Private video]"):
             continue
         out.append(SearchResult(
             title=e.get("title") or "Unknown", url=url, duration=to_int(e.get("duration")),
@@ -73,6 +73,11 @@ async def search_youtube(query: str, limit: int) -> list[SearchResult]:
             live=e.get("live_status") == "is_live" or bool(e.get("is_live")),
         ))
     return out
+
+
+async def search_youtube(query: str, limit: int) -> list[SearchResult]:
+    data = await ytdl.extract(f"ytsearch{limit}:{query}", flat=True, timeout=40)
+    return _ytdlp_results(data)
 
 
 async def youtube_title(url: str) -> str | None:
@@ -196,6 +201,69 @@ async def youtube_info(vid: str) -> SearchResult | None:
         uploader=details.get("author"), source="YouTube",
         thumbnail=thumbs[-1].get("url") if thumbs else None,
     )
+
+
+# ── Плейлисты и альбомы YouTube / YouTube Music ───────────────────────────────
+_YT_LIST_RE = re.compile(r"(?:youtube\.com|youtu\.be)/\S*?[?&]list=([\w-]+)")
+_YTM_BROWSE_RE = re.compile(r"music\.youtube\.com/browse/(MPREb_[\w-]+|VL[\w-]+)")
+
+
+def parse_youtube_playlist(url: str) -> tuple[str, str | None] | None:
+    """Ссылка на плейлист/альбом YouTube или YT Music → (id списка, id ролика из ссылки).
+
+    Альбом YT Music (browse/MPREb_…) → ('MPREb_…', None). Миксы (list=RD…) —
+    бесконечное радио к ролику, а не плейлист: их играем как один ролик (→ None).
+    Официальные подборки YT Music (RDCLAK5uy_…) — настоящие плейлисты.
+    """
+    m = _YTM_BROWSE_RE.search(url or "")
+    if m:
+        return m.group(1).removeprefix("VL"), None
+    m = _YT_LIST_RE.search(url or "")
+    if not m:
+        return None
+    list_id = m.group(1)
+    if list_id.startswith("RD") and not list_id.startswith("RDCLAK"):
+        return None
+    return list_id, ytdl.video_id(url)
+
+
+def _ytm_playlist(list_id: str, limit: int) -> tuple[str, list[SearchResult]]:
+    if list_id.startswith("MPREb_"):
+        data = _ytmusic().get_album(list_id)
+    else:
+        data = _ytmusic().get_playlist(list_id, limit=limit)
+    cover = data.get("thumbnails") or []      # у треков альбома своих обложек нет
+    tracks = []
+    for t in data.get("tracks") or []:
+        if t.get("isAvailable") is False:
+            continue
+        r = _ytm_to_result({**t, "thumbnails": t.get("thumbnails") or cover})
+        if r:
+            tracks.append(r)
+    return data.get("title") or "плейлист", tracks
+
+
+async def youtube_playlist(list_id: str, start: str | None = None) -> tuple[str, list[SearchResult]]:
+    """Треки плейлиста или альбома → (название, треки), не больше MAX_PLAYLIST_TRACKS.
+
+    Сначала через YouTube Music (быстро, без куки и JS-challenge), не вышло — yt-dlp.
+    start — ролик из ссылки «watch?v=…&list=…»: как и YouTube, играем начиная с него.
+    """
+    limit = config.MAX_PLAYLIST_TRACKS * (2 if start else 1)
+    try:
+        name, tracks = await asyncio.wait_for(asyncio.to_thread(_ytm_playlist, list_id, limit), 20)
+    except Exception as e:  # noqa: BLE001
+        logger.info("[ytmusic] плейлист %s: %s — пробую yt-dlp", list_id, e)
+        name, tracks = "", []
+    if not tracks:
+        url = (f"https://music.youtube.com/browse/{list_id}" if list_id.startswith("MPREb_")
+               else f"https://www.youtube.com/playlist?list={list_id}")
+        data = await ytdl.extract(url, flat=True, timeout=60, playlist_end=limit)
+        name, tracks = data.get("title") or "плейлист", _ytdlp_results(data)
+    ids = [ytdl.video_id(t.url) for t in tracks]
+    if start in ids:
+        tracks = tracks[ids.index(start):]
+    return name, tracks[:config.MAX_PLAYLIST_TRACKS]
 
 
 _NORM_RE = re.compile(r"[^\w\s]+", re.UNICODE)

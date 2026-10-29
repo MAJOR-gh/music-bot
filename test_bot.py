@@ -16,6 +16,7 @@ import tempfile
 import time
 import traceback
 
+import config
 from music import player as player_module
 from music import sources, ytdl
 from music.cog import MusicCog, _field
@@ -732,6 +733,115 @@ async def test_play_enter_uses_shown_suggestion():
     assert sent and "BFG Division" in sent[0], sent
 
 
+def test_youtube_playlist_parsing():
+    parse = sources.parse_youtube_playlist
+    assert parse("https://www.youtube.com/playlist?list=PLabc_DEF-123") == ("PLabc_DEF-123", None)
+    assert parse("https://music.youtube.com/playlist?list=OLAK5uy_xyz&si=q") == ("OLAK5uy_xyz", None)
+    assert parse("https://www.youtube.com/watch?v=V2SVRJ6dcE4&list=PLabc&index=3") == (
+        "PLabc", "V2SVRJ6dcE4")
+    assert parse("https://youtu.be/V2SVRJ6dcE4?list=PLabc") == ("PLabc", "V2SVRJ6dcE4")
+    assert parse("https://music.youtube.com/browse/MPREb_Album1") == ("MPREb_Album1", None)
+    assert parse("https://music.youtube.com/browse/VLPLabc") == ("PLabc", None)
+    assert parse("https://music.youtube.com/playlist?list=RDCLAK5uy_top") == ("RDCLAK5uy_top", None)
+    # микс — радио к ролику, а не плейлист; обычный ролик — тоже не плейлист
+    assert parse("https://www.youtube.com/watch?v=V2SVRJ6dcE4&list=RDV2SVRJ6dcE4") is None
+    assert parse("https://music.youtube.com/watch?v=V2SVRJ6dcE4&list=RDAMVMV2SVRJ6dcE4") is None
+    assert parse("https://www.youtube.com/watch?v=V2SVRJ6dcE4") is None
+    assert parse("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M") is None
+
+
+def _yt(vid: str, title: str) -> SearchResult:
+    return SearchResult(title=title, url=sources.youtube_url(vid), duration=100, uploader="Band")
+
+
+async def test_youtube_playlist_tracks():
+    """Плейлист берётся из YT Music; не вышло — из yt-dlp; ссылка с роликом — играем с него."""
+    calls = []
+
+    def ytm(list_id, limit):
+        calls.append(("ytm", list_id))
+        return "Mix", [_yt("aaaaaaaaaaa", "A"), _yt("bbbbbbbbbbb", "B"), _yt("ccccccccccc", "C")]
+
+    async def no_ytdlp(*args, **kwargs):
+        raise AssertionError("yt-dlp не нужен")
+
+    orig_ytm, orig_extract = sources._ytm_playlist, ytdl.extract
+    sources._ytm_playlist, ytdl.extract = ytm, no_ytdlp
+    try:
+        name, tracks = await sources.youtube_playlist("PLx")
+        assert name == "Mix" and [t.title for t in tracks] == ["A", "B", "C"]
+        name, tracks = await sources.youtube_playlist("PLx", start="bbbbbbbbbbb")
+        assert [t.title for t in tracks] == ["B", "C"]
+        name, tracks = await sources.youtube_playlist("PLx", start="zzzzzzzzzzz")
+        assert [t.title for t in tracks] == ["A", "B", "C"]      # ролика нет в списке — с начала
+
+        def broken(list_id, limit):
+            raise KeyError("contents")
+
+        async def ytdlp(target, *, flat=False, timeout=60, playlist_end=None):
+            calls.append(("ytdlp", target, flat, playlist_end))
+            return {"title": "Old", "entries": [
+                {"url": "https://www.youtube.com/watch?v=ddddddddddd", "title": "D", "duration": 60},
+                {"url": "https://www.youtube.com/watch?v=eeeeeeeeeee", "title": "[Deleted video]"},
+                None]}
+        sources._ytm_playlist, ytdl.extract = broken, ytdlp
+        name, tracks = await sources.youtube_playlist("PLold")
+        assert name == "Old" and [t.title for t in tracks] == ["D"]
+        assert calls[-1] == ("ytdlp", "https://www.youtube.com/playlist?list=PLold", True,
+                             config.MAX_PLAYLIST_TRACKS)
+        await sources.youtube_playlist("MPREb_Album1")
+        assert calls[-1][1] == "https://music.youtube.com/browse/MPREb_Album1"
+    finally:
+        sources._ytm_playlist, ytdl.extract = orig_ytm, orig_extract
+
+
+async def test_play_youtube_playlist():
+    """/play со ссылкой на плейлист ставит все треки; закрытый плейлист с роликом — играет ролик."""
+    import types
+    cog = MusicCog(None, 60)
+    sent, queued = [], []
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def voice(interaction):
+        return object()
+
+    async def enqueue(interaction, tracks):
+        queued.extend(tracks)
+        return True
+
+    async def send(text=None, **kwargs):
+        sent.append(text)
+
+    async def playlist(list_id, start=None):
+        if list_id == "PLprivate":
+            raise ValueError("private")
+        return "Doom", [_yt("aaaaaaaaaaa", "A"), _yt("bbbbbbbbbbb", "B")]
+
+    async def one(url, requester):
+        return _yt("ccccccccccc", "Single").to_track(requester)
+
+    cog._ensure_voice, cog.enqueue, cog._track_from_url = voice, enqueue, one
+    inter = types.SimpleNamespace(
+        response=types.SimpleNamespace(defer=noop), followup=types.SimpleNamespace(send=send),
+        user=types.SimpleNamespace(display_name="me"), namespace=types.SimpleNamespace(source=None))
+    orig = sources.youtube_playlist
+    sources.youtube_playlist = playlist
+    try:
+        await MusicCog.play.callback(cog, inter, "https://music.youtube.com/playlist?list=PLdoom", None)
+        assert [t.title for t in queued] == ["A", "B"] and "Doom" in sent[-1] and "**2**" in sent[-1]
+        queued.clear()
+        await MusicCog.play.callback(
+            cog, inter, "https://www.youtube.com/watch?v=ccccccccccc&list=PLprivate", None)
+        assert [t.title for t in queued] == ["Single"], queued
+        queued.clear()
+        await MusicCog.play.callback(cog, inter, "https://www.youtube.com/playlist?list=PLprivate", None)
+        assert not queued and "плейлист" in sent[-1], sent
+    finally:
+        sources.youtube_playlist = orig
+
+
 def test_private_urls_rejected():
     from music.cog import _is_public_url
     for url in ("http://127.0.0.1:4416/ping", "http://localhost/x", "http://169.254.169.254/latest",
@@ -846,8 +956,11 @@ ASYNC_TESTS = [
     test_extract_cooldown_after_all_clients_fail,
     test_youtube_link_metadata_without_ytdlp,
     test_play_enter_uses_shown_suggestion,
+    test_youtube_playlist_tracks,
+    test_play_youtube_playlist,
 ]
-SYNC_TESTS = [test_helpers, test_spotify_parsing, test_match_score_prefers_right_song,
+SYNC_TESTS = [test_helpers, test_spotify_parsing, test_youtube_playlist_parsing,
+              test_match_score_prefers_right_song,
               test_split_artist_title, test_bot_check_detected, test_soundcloud_picks_matching_track,
               test_updater_picks_latest, test_discard_file_waits_until_unlocked, test_queue_tools,
               test_private_urls_rejected]

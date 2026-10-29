@@ -38,7 +38,7 @@ LASTFM_API_KEY: str = os.getenv("LASTFM_API_KEY", "").strip()
 # По умолчанию выключено: качество там ниже, а подсовывает он и перезаливы.
 SOUNDCLOUD_FALLBACK: bool = os.getenv("SOUNDCLOUD_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
-# Сколько треков максимум брать из плейлиста/альбома Spotify за раз.
+# Сколько треков максимум брать из плейлиста/альбома (YouTube, YT Music, Spotify) за раз.
 MAX_PLAYLIST_TRACKS: int = max(1, int(os.getenv("MAX_PLAYLIST_TRACKS", "100")))
 
 # Автообновление yt-dlp (раз в 12 часов). YouTube постоянно ломает старые версии:

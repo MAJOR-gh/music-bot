@@ -440,6 +440,20 @@ class MusicCog(commands.Cog):
         head = "▶️ Запускаю" if was_idle else "➕ В очередь"
         return f"{head}: **{short_title(track.display_title, 100)}**{track.duration_tag}"
 
+    async def _enqueue_list(self, interaction: discord.Interaction, tracks: list[Track],
+                            label: str) -> None:
+        """Плейлист/альбом в очередь и короткий отчёт в чат (label — «Spotify «Mix»»)."""
+        was_idle = await self.enqueue(interaction, tracks)
+        if was_idle is None:
+            return
+        if len(tracks) == 1:
+            await interaction.followup.send(self.enqueue_message(was_idle, tracks[0]))
+        else:
+            await interaction.followup.send(
+                f"📋 {label}: добавил **{len(tracks)}** треков"
+                + (" — запускаю." if was_idle else " в очередь.")
+            )
+
     async def _resolve(self, interaction: discord.Interaction, track: Track) -> bool:
         """Трек из Spotify/Last.fm → сразу найти его на YouTube Music.
 
@@ -584,7 +598,7 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="play", description="Включить трек: ссылка или поиск с подсказками")
     @app_commands.describe(
-        query="Ссылка (YouTube, YouTube Music, Spotify) или название — выбери из подсказок",
+        query="Ссылка на трек или плейлист (YouTube, YT Music, Spotify) или название",
         source="Где искать текст: YouTube, YouTube Music, Spotify или Last.fm",
     )
     @app_commands.choices(source=SOURCE_CHOICES)
@@ -615,17 +629,27 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send("❌ В этой ссылке Spotify нет треков.")
                 return
             tracks = [t.to_result().to_track(requester) for t in sp_tracks]
-            was_idle = await self.enqueue(interaction, tracks)
-            if was_idle is None:
-                return
-            if len(tracks) == 1:
-                await interaction.followup.send(self.enqueue_message(was_idle, tracks[0]))
-            else:
-                await interaction.followup.send(
-                    f"📋 Spotify «{short_title(name, 100)}»: добавил **{len(tracks)}** треков"
-                    + (" — запускаю." if was_idle else " в очередь.")
-                )
+            await self._enqueue_list(interaction, tracks, f"Spotify «{short_title(name, 100)}»")
             return
+
+        # Плейлист или альбом YouTube / YouTube Music → все треки разом. Если его
+        # не открыть (приватный и т.п.), а в ссылке есть ролик, — играем ролик.
+        playlist = sources.parse_youtube_playlist(query)
+        if playlist:
+            list_id, start = playlist
+            try:
+                name, results = await sources.youtube_playlist(list_id, start)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[play] плейлист %s: %s", query, e)
+                name, results = "", []
+            if results:
+                tracks = [r.to_track(requester) for r in results]
+                await self._enqueue_list(interaction, tracks, f"Плейлист «{short_title(name, 100)}»")
+                return
+            if start is None:
+                await interaction.followup.send(
+                    "❌ Не смог открыть плейлист — он приватный, пустой или удалён.")
+                return
 
         # Выбран вариант из подсказок → метаданные уже есть, yt-dlp не нужен.
         # Enter без выбора → первая подсказка, которую человек видел в списке.
